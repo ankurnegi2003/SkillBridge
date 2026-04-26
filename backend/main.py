@@ -4,6 +4,7 @@ import os
 import random
 import re
 import sqlite3
+import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
@@ -13,7 +14,14 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadF
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from config import GEMINI_API_KEY, GEMINI_MODEL
+from config import (
+    ALLOWED_ORIGINS,
+    GEMINI_API_KEY,
+    GEMINI_MODEL,
+    MAX_SKILLS_FOR_QUESTION_GENERATION,
+    PRACTICE_TEST_GEMINI_API_KEY,
+    QUESTION_GEMINI_API_KEY,
+)
 from database import get_connection, init_db
 
 try:
@@ -38,7 +46,7 @@ app = FastAPI(title="Skill Assessment Agent API", version="1.0.0", lifespan=life
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -46,6 +54,25 @@ app.add_middleware(
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
+
+
+GENAI_CONFIG_LOCK = threading.Lock()
+
+
+def _generate_gemini_content(model_name: str, prompt: str, timeout_seconds: int, api_key: str | None = None):
+    key_to_use = (api_key or GEMINI_API_KEY).strip()
+    if not key_to_use:
+        raise RuntimeError("Gemini API key is not configured.")
+
+    default_key = GEMINI_API_KEY.strip()
+    with GENAI_CONFIG_LOCK:
+        genai.configure(api_key=key_to_use)
+        try:
+            model = genai.GenerativeModel(model_name)
+            return model.generate_content(prompt, request_options={"timeout": timeout_seconds})
+        finally:
+            if default_key and key_to_use != default_key:
+                genai.configure(api_key=default_key)
 
 
 def _extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
@@ -511,9 +538,8 @@ Return format:
         if time.monotonic() >= deadline:
             break
         try:
-            model = genai.GenerativeModel(model_name)
             # Keep extraction responsive; if the model is slow, fall back to deterministic matching.
-            response = model.generate_content(prompt, request_options={"timeout": 10})
+            response = _generate_gemini_content(model_name, prompt, timeout_seconds=10)
             raw_text = (response.text or "").strip()
             cleaned = raw_text.replace("```json", "").replace("```", "").strip()
             parsed = json.loads(cleaned)
@@ -1196,7 +1222,8 @@ def _normalize_mcq_question(item: dict, fallback_index: int, skill_name: str) ->
 
 
 def _generate_questions_for_skill(skill_name: str) -> list[dict]:
-    if not GEMINI_API_KEY:
+    question_api_key = (QUESTION_GEMINI_API_KEY or GEMINI_API_KEY).strip()
+    if not question_api_key:
         return _fallback_questions_for_skill(skill_name)
 
     family = _skill_question_family(skill_name)
@@ -1255,9 +1282,13 @@ Return format:
     model_candidates = _get_model_candidates()
     for model_name in model_candidates:
         try:
-            model = genai.GenerativeModel(model_name)
             # Keep assessment start responsive; fallback questions are used if model is slow.
-            response = model.generate_content(prompt, request_options={"timeout": 12})
+            response = _generate_gemini_content(
+                model_name,
+                prompt,
+                timeout_seconds=12,
+                api_key=question_api_key,
+            )
             raw_text = (response.text or "").strip()
             cleaned = raw_text.replace("```json", "").replace("```", "").strip()
             parsed = json.loads(cleaned)
@@ -1281,7 +1312,7 @@ def _generate_missing_questions_for_session(session_id: int) -> int:
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found.")
 
-    skills = _get_session_present_skills(session_id)
+    skills = _get_session_present_skills(session_id)[:MAX_SKILLS_FOR_QUESTION_GENERATION]
     if not skills:
         return 0
 
@@ -1913,6 +1944,22 @@ async def get_module3_summary(session_id: int):
 
 class TopicCompletionUpdate(BaseModel):
     is_completed: bool
+    plan_id: int | None = None
+    skill_id: int | None = None
+    topic_name: str | None = None
+    day_number: int | None = None
+
+
+class PracticeTestAnswer(BaseModel):
+    question_id: int
+    selected_option_index: int
+
+
+class PracticeTestSubmission(BaseModel):
+    answers: list[PracticeTestAnswer]
+
+
+MAX_STUDY_PLAN_ENTRIES = 7
 
 
 def _free_resources_for_skill(skill_name: str) -> list[dict]:
@@ -1973,77 +2020,669 @@ def _free_resources_for_skill(skill_name: str) -> list[dict]:
     return overrides.get(canonical, base_resources)
 
 
-def _subtopics_for_skill(skill_name: str, mode: str = "foundation") -> list[str]:
+VIDEO_SUGGESTIONS_BY_SKILL = {
+    "Python": [
+        {
+            "title": "Corey Schafer Python Tutorials",
+            "url": "https://www.youtube.com/playlist?list=PL-osiE80TeTt2d9bfVyTiXJA-UTHn6WwU",
+            "type": "video",
+        }
+    ],
+    "SQL": [
+        {
+            "title": "freeCodeCamp SQL Tutorial - Full Database Course for Beginners",
+            "url": "https://www.youtube.com/watch?v=HXV3zeQKqGY",
+            "type": "video",
+        }
+    ],
+    "JavaScript": [
+        {
+            "title": "JavaScript Full Course for Beginners",
+            "url": "https://www.youtube.com/watch?v=PkZNo7MFNFg",
+            "type": "video",
+        }
+    ],
+    "React": [
+        {
+            "title": "React Course - Beginner's Tutorial for React JavaScript Library",
+            "url": "https://www.youtube.com/watch?v=bMknfKXIFA8",
+            "type": "video",
+        }
+    ],
+}
+
+
+VIDEO_RESOURCES_BY_SKILL = {
+    "Data Structures": [
+        {
+            "title": "Data Structures Easy to Advanced Course - Full Tutorial from a Google Engineer",
+            "url": "https://www.youtube.com/watch?v=RBSGKlAvoiM",
+            "type": "video",
+        }
+    ],
+    "Algorithms": [
+        {
+            "title": "Algorithms and Data Structures Tutorial - Full Course for Beginners",
+            "url": "https://www.youtube.com/watch?v=8hly31xKli0",
+            "type": "video",
+        }
+    ],
+    "Object-Oriented Programming": [
+        {
+            "title": "Object Oriented Programming (OOP) in Python 3",
+            "url": "https://www.youtube.com/watch?v=JeznW_7DlB0",
+            "type": "video",
+        }
+    ],
+    "Operating Systems": [
+        {
+            "title": "Operating Systems Full Course",
+            "url": "https://www.youtube.com/watch?v=26QPDBe-NB8",
+            "type": "video",
+        }
+    ],
+    "Networking": [
+        {
+            "title": "Computer Networking Course - Network Engineering",
+            "url": "https://www.youtube.com/watch?v=qiQR5rTSshw",
+            "type": "video",
+        }
+    ],
+    "System Design": [
+        {
+            "title": "System Design Interview Course",
+            "url": "https://www.youtube.com/watch?v=bUHFg8CZFws",
+            "type": "video",
+        }
+    ],
+    "C": [
+        {
+            "title": "C Programming Tutorial for Beginners",
+            "url": "https://www.youtube.com/watch?v=KJgsSFOSQv0",
+            "type": "video",
+        }
+    ],
+    "C++": [
+        {
+            "title": "C++ Programming Course - Beginner to Advanced",
+            "url": "https://www.youtube.com/watch?v=8jLOx1hD3_o",
+            "type": "video",
+        }
+    ],
+    "Java": [
+        {
+            "title": "Java Tutorial for Beginners",
+            "url": "https://www.youtube.com/watch?v=eIrMbAQSU34",
+            "type": "video",
+        }
+    ],
+    "Python": [
+        {
+            "title": "Python Full Course for Beginners",
+            "url": "https://www.youtube.com/watch?v=rfscVS0vtbw",
+            "type": "video",
+        }
+    ],
+    "JavaScript": [
+        {
+            "title": "JavaScript Tutorial for Beginners - Full Course",
+            "url": "https://www.youtube.com/watch?v=PkZNo7MFNFg",
+            "type": "video",
+        }
+    ],
+    "TypeScript": [
+        {
+            "title": "TypeScript Course for Beginners",
+            "url": "https://www.youtube.com/watch?v=30LWjhZzg50",
+            "type": "video",
+        }
+    ],
+    "Go": [
+        {
+            "title": "Learn Go Programming - Golang Tutorial for Beginners",
+            "url": "https://www.youtube.com/watch?v=YS4e4q9oBaU",
+            "type": "video",
+        }
+    ],
+    "Rust": [
+        {
+            "title": "Rust Programming Course for Beginners",
+            "url": "https://www.youtube.com/watch?v=BpPEoZW5IiY",
+            "type": "video",
+        }
+    ],
+    "PHP": [
+        {
+            "title": "PHP Tutorial for Beginners",
+            "url": "https://www.youtube.com/watch?v=OK_JCtrrv-c",
+            "type": "video",
+        }
+    ],
+    "Ruby": [
+        {
+            "title": "Ruby Programming Language - Full Course",
+            "url": "https://www.youtube.com/watch?v=t_ispmWmdjY",
+            "type": "video",
+        }
+    ],
+    "HTML": [
+        {
+            "title": "HTML Full Course - Build a Website Tutorial",
+            "url": "https://www.youtube.com/watch?v=pQN-pnXPaVg",
+            "type": "video",
+        }
+    ],
+    "CSS": [
+        {
+            "title": "CSS Tutorial - Zero to Hero",
+            "url": "https://www.youtube.com/watch?v=1Rs2ND1ryYc",
+            "type": "video",
+        }
+    ],
+    "React": [
+        {
+            "title": "React Course - Beginner's Tutorial for React JavaScript Library",
+            "url": "https://www.youtube.com/watch?v=bMknfKXIFA8",
+            "type": "video",
+        }
+    ],
+    "Angular": [
+        {
+            "title": "Angular Full Course for Beginners",
+            "url": "https://www.youtube.com/watch?v=3qBXWUpoPHo",
+            "type": "video",
+        }
+    ],
+    "Vue.js": [
+        {
+            "title": "Vue.js Course for Beginners",
+            "url": "https://www.youtube.com/watch?v=FXpIoQ_rT_c",
+            "type": "video",
+        }
+    ],
+    "Next.js": [
+        {
+            "title": "Next.js Full Course for Beginners",
+            "url": "https://www.youtube.com/watch?v=wm5gMKuwSYk",
+            "type": "video",
+        }
+    ],
+    "Node.js": [
+        {
+            "title": "Node.js and Express.js - Full Course",
+            "url": "https://www.youtube.com/watch?v=Oe421EPjeBE",
+            "type": "video",
+        }
+    ],
+    "Express.js": [
+        {
+            "title": "Express.js Crash Course",
+            "url": "https://www.youtube.com/watch?v=L72fhGm1tfE",
+            "type": "video",
+        }
+    ],
+    "FastAPI": [
+        {
+            "title": "FastAPI Course for Beginners",
+            "url": "https://www.youtube.com/watch?v=0sOvCWFmrtA",
+            "type": "video",
+        }
+    ],
+    "Django": [
+        {
+            "title": "Django Course for Beginners",
+            "url": "https://www.youtube.com/watch?v=F5mRW0jo-U4",
+            "type": "video",
+        }
+    ],
+    "Flask": [
+        {
+            "title": "Flask Course - Python Web Application Development",
+            "url": "https://www.youtube.com/watch?v=Z1RJmh_OqeA",
+            "type": "video",
+        }
+    ],
+    "Spring Boot": [
+        {
+            "title": "Spring Boot Tutorial for Beginners",
+            "url": "https://www.youtube.com/watch?v=9SGDpanrc8U",
+            "type": "video",
+        }
+    ],
+    "SQL": [
+        {
+            "title": "SQL Tutorial - Full Database Course for Beginners",
+            "url": "https://www.youtube.com/watch?v=HXV3zeQKqGY",
+            "type": "video",
+        }
+    ],
+    "SQLite": [
+        {
+            "title": "SQLite Tutorial for Beginners",
+            "url": "https://www.youtube.com/watch?v=byHcYRpMgI4",
+            "type": "video",
+        }
+    ],
+    "PostgreSQL": [
+        {
+            "title": "PostgreSQL Tutorial Full Course",
+            "url": "https://www.youtube.com/watch?v=SpfIwlAYaKk",
+            "type": "video",
+        }
+    ],
+    "MySQL": [
+        {
+            "title": "MySQL Full Course for Beginners",
+            "url": "https://www.youtube.com/watch?v=7S_tz1z_5bA",
+            "type": "video",
+        }
+    ],
+    "MongoDB": [
+        {
+            "title": "MongoDB Tutorial for Beginners",
+            "url": "https://www.youtube.com/watch?v=ofme2o29ngU",
+            "type": "video",
+        }
+    ],
+    "Git": [
+        {
+            "title": "Git and GitHub for Beginners - Crash Course",
+            "url": "https://www.youtube.com/watch?v=RGOj5yH7evk",
+            "type": "video",
+        }
+    ],
+    "REST API": [
+        {
+            "title": "REST API Concepts and Examples",
+            "url": "https://www.youtube.com/watch?v=lsMQRaeKNDk",
+            "type": "video",
+        }
+    ],
+    "GraphQL": [
+        {
+            "title": "GraphQL Course for Beginners",
+            "url": "https://www.youtube.com/watch?v=ed8SzALpx1Q",
+            "type": "video",
+        }
+    ],
+    "Docker": [
+        {
+            "title": "Docker Tutorial for Beginners",
+            "url": "https://www.youtube.com/watch?v=fqMOX6JJhGo",
+            "type": "video",
+        }
+    ],
+    "Kubernetes": [
+        {
+            "title": "Kubernetes Course for Beginners",
+            "url": "https://www.youtube.com/watch?v=X48VuDVv0do",
+            "type": "video",
+        }
+    ],
+    "AWS": [
+        {
+            "title": "AWS Cloud Practitioner Full Course",
+            "url": "https://www.youtube.com/watch?v=SOTamWNgDKc",
+            "type": "video",
+        }
+    ],
+    "GCP": [
+        {
+            "title": "Google Cloud Platform Full Course",
+            "url": "https://www.youtube.com/watch?v=jpno8FSqpc8",
+            "type": "video",
+        }
+    ],
+    "Azure": [
+        {
+            "title": "Microsoft Azure Fundamentals Full Course",
+            "url": "https://www.youtube.com/watch?v=NKEFWyqJ5XA",
+            "type": "video",
+        }
+    ],
+    "DevOps": [
+        {
+            "title": "DevOps Engineering Course for Beginners",
+            "url": "https://www.youtube.com/watch?v=j5Zsa_eOXeY",
+            "type": "video",
+        }
+    ],
+    "CI/CD": [
+        {
+            "title": "CI/CD Explained",
+            "url": "https://www.youtube.com/watch?v=1er2cjUq1UI",
+            "type": "video",
+        }
+    ],
+    "Linux": [
+        {
+            "title": "Linux for Beginners",
+            "url": "https://www.youtube.com/watch?v=sWbUDq4S6Y8",
+            "type": "video",
+        }
+    ],
+    "Machine Learning": [
+        {
+            "title": "Machine Learning Course for Beginners",
+            "url": "https://www.youtube.com/watch?v=i_LwzRVP7bg",
+            "type": "video",
+        }
+    ],
+    "Deep Learning": [
+        {
+            "title": "Deep Learning Full Course",
+            "url": "https://www.youtube.com/watch?v=aircAruvnKk",
+            "type": "video",
+        }
+    ],
+    "NLP": [
+        {
+            "title": "Natural Language Processing Full Course",
+            "url": "https://www.youtube.com/watch?v=fOvTtapxa9c",
+            "type": "video",
+        }
+    ],
+    "Computer Vision": [
+        {
+            "title": "Computer Vision Full Course",
+            "url": "https://www.youtube.com/watch?v=IA3WxTTPXqQ",
+            "type": "video",
+        }
+    ],
+    "Cybersecurity": [
+        {
+            "title": "Cyber Security Full Course for Beginners",
+            "url": "https://www.youtube.com/watch?v=U_P23SqJaDc",
+            "type": "video",
+        }
+    ],
+    "Testing": [
+        {
+            "title": "Software Testing Tutorial for Beginners",
+            "url": "https://www.youtube.com/watch?v=uz5PvLkGpyw",
+            "type": "video",
+        }
+    ],
+    "Microservices": [
+        {
+            "title": "Microservices Explained",
+            "url": "https://www.youtube.com/watch?v=rv4LlmLmVWk",
+            "type": "video",
+        }
+    ],
+    "Distributed Systems": [
+        {
+            "title": "Distributed Systems in One Lesson",
+            "url": "https://www.youtube.com/watch?v=Y6Ev8GIlbxc",
+            "type": "video",
+        }
+    ],
+}
+
+
+def _subtopics_for_skill(skill_name: str, mode: str = "foundation", stage_index: int = 1) -> list[str]:
     canonical = _canonical_skill_label(skill_name)
 
     specific = {
         "Python": {
             "foundation": [
-                "Core data structures and comprehensions",
-                "Functions, scope, and modules",
-                "Exceptions and file handling",
+                [
+                    "Python data types and mutability",
+                    "Control flow and comprehensions",
+                    "Functions, scope, and return values",
+                ],
+                [
+                    "Modules and package imports",
+                    "Exception handling patterns",
+                    "File I/O with context managers",
+                ],
+                [
+                    "Iterators and generators",
+                    "Object-oriented design basics",
+                    "Testing with pytest assertions",
+                ],
             ],
             "gap": [
-                "Decorators and context managers",
-                "Async functions and await patterns",
-                "Multithreading vs multiprocessing",
+                [
+                    "Decorators and context managers",
+                    "Async functions and await patterns",
+                    "Type hints and static analysis",
+                ],
+                [
+                    "Concurrency: threading vs multiprocessing",
+                    "Profiling and performance bottlenecks",
+                    "Advanced error handling and retries",
+                ],
+                [
+                    "Interview coding patterns in Python",
+                    "Code readability and refactoring drills",
+                    "Debugging edge cases under time pressure",
+                ],
             ],
         },
         "FastAPI": {
             "foundation": [
-                "Path operations and request validation",
-                "Pydantic models and response schemas",
-                "Dependency injection basics",
+                [
+                    "Path operations and request validation",
+                    "Pydantic models and response schemas",
+                    "HTTP status codes and error responses",
+                ],
+                [
+                    "Dependency injection basics",
+                    "Route organization and APIRouter",
+                    "Request/response middleware flow",
+                ],
+                [
+                    "SQLModel/ORM integration basics",
+                    "CRUD endpoint structure",
+                    "Testing endpoints with TestClient",
+                ],
             ],
             "gap": [
-                "Background tasks and async endpoints",
-                "Auth, middleware, and error handling",
-                "Database sessions and transactions",
+                [
+                    "Background tasks and async endpoints",
+                    "Auth dependencies and token validation",
+                    "Database sessions and transactions",
+                ],
+                [
+                    "Pagination, filtering, and sorting APIs",
+                    "Rate limiting and API hardening",
+                    "Observability: logging and tracing hooks",
+                ],
+                [
+                    "Designing interview-ready API architecture",
+                    "Trade-offs in sync vs async handlers",
+                    "Failure-mode and resilience patterns",
+                ],
             ],
         },
         "SQL": {
             "foundation": [
-                "SELECT, WHERE, GROUP BY, ORDER BY",
-                "INNER/LEFT joins and relationship mapping",
-                "Aggregations and filtering patterns",
+                [
+                    "SELECT, WHERE, GROUP BY, ORDER BY",
+                    "INNER/LEFT joins and relationship mapping",
+                    "Aggregate functions and HAVING",
+                ],
+                [
+                    "CASE statements and conditional logic",
+                    "CTEs for readable query structure",
+                    "Subqueries and correlated subqueries",
+                ],
+                [
+                    "Schema design and normalization basics",
+                    "Indexes and execution plan reading",
+                    "Transaction boundaries and rollback",
+                ],
             ],
             "gap": [
-                "Window functions",
-                "Indexing and query plans",
-                "Transactions and isolation levels",
+                [
+                    "Window functions with PARTITION BY",
+                    "Advanced join strategies",
+                    "Query optimization heuristics",
+                ],
+                [
+                    "Isolation levels and locking behavior",
+                    "Data consistency patterns",
+                    "Performance tuning with real datasets",
+                ],
+                [
+                    "Interview SQL problem decomposition",
+                    "Explaining query complexity clearly",
+                    "Debugging incorrect query results fast",
+                ],
             ],
         },
         "React": {
             "foundation": [
-                "JSX and component composition",
-                "Props/state flow",
-                "useEffect and lifecycle thinking",
+                [
+                    "JSX and component composition",
+                    "Props/state flow",
+                    "Event handling patterns",
+                ],
+                [
+                    "useEffect dependency management",
+                    "Component state normalization",
+                    "Form handling and validation",
+                ],
+                [
+                    "Routing and page-level state",
+                    "API fetching and loading/error states",
+                    "Component testing with React Testing Library",
+                ],
             ],
             "gap": [
-                "Memoization and render optimization",
-                "State architecture and custom hooks",
-                "Error boundaries and resilient UI patterns",
+                [
+                    "Memoization and render optimization",
+                    "State architecture and custom hooks",
+                    "Error boundaries and resilient UI patterns",
+                ],
+                [
+                    "Performance profiling with React DevTools",
+                    "Data caching and stale state handling",
+                    "Accessibility and semantic UI checks",
+                ],
+                [
+                    "Frontend interview question walkthroughs",
+                    "Trade-offs in state management choices",
+                    "Refactoring a feature for maintainability",
+                ],
             ],
         },
     }
 
+    stage = max(1, _safe_int(stage_index, 1))
+
     if canonical in specific:
-        if mode == "gap":
-            return specific[canonical]["gap"]
-        return specific[canonical]["foundation"]
+        tracks = specific[canonical]["gap"] if mode == "gap" else specific[canonical]["foundation"]
+        return tracks[min(stage - 1, len(tracks) - 1)]
 
     if mode == "gap":
-        return [
-            f"Advanced patterns in {canonical}",
-            f"Performance and debugging in {canonical}",
-            f"Interview-style problem solving with {canonical}",
+        fallback_tracks = [
+            [
+                f"Intermediate workflows in {canonical}",
+                f"Debugging common failures in {canonical}",
+                f"Performance basics in {canonical}",
+            ],
+            [
+                f"Advanced architecture choices in {canonical}",
+                f"Scalability and maintainability in {canonical}",
+                f"Testing strategy for {canonical}",
+            ],
+            [
+                f"Interview scenarios using {canonical}",
+                f"Trade-off discussion for {canonical}",
+                f"Rapid problem solving with {canonical}",
+            ],
         ]
+        return fallback_tracks[min(stage - 1, len(fallback_tracks) - 1)]
 
-    return [
-        f"Core concepts of {canonical}",
-        f"Hands-on basics in {canonical}",
-        f"Common mistakes and best practices in {canonical}",
+    fallback_tracks = [
+        [
+            f"Fundamentals and terminology in {canonical}",
+            f"Setup and first working example in {canonical}",
+            f"Core workflow in {canonical}",
+        ],
+        [
+            f"Applied exercises in {canonical}",
+            f"Error handling patterns in {canonical}",
+            f"Reusable patterns in {canonical}",
+        ],
+        [
+            f"Real-world mini project with {canonical}",
+            f"Optimization and maintainability in {canonical}",
+            f"Interview explanation practice for {canonical}",
+        ],
     ]
+    return fallback_tracks[min(stage - 1, len(fallback_tracks) - 1)]
+
+
+def _study_mode_for_occurrence(skill: dict, occurrence_index: int) -> str:
+    category = str(skill.get("category", "")).lower()
+    if category == "present":
+        return "gap"
+    if occurrence_index <= 2:
+        return "foundation"
+    return "gap"
+
+
+def _topic_label_for_progression(skill_name: str, mode: str, occurrence_index: int) -> str:
+    canonical = _canonical_skill_label(skill_name)
+    if mode == "foundation":
+        labels = ["Core Fundamentals", "Applied Basics", "Hands-on Build"]
+    else:
+        labels = ["Gap Closure", "Advanced Patterns", "Interview Drill"]
+    base = labels[min(max(1, occurrence_index) - 1, len(labels) - 1)]
+    return f"{canonical} - {base}"
+
+
+def _ensure_progressive_subtopics(
+    skill_name: str,
+    mode: str,
+    occurrence_index: int,
+    candidate_subtopics: list[str],
+    used_subtopics: set[str],
+) -> list[str]:
+    cleaned = []
+    seen_local = set()
+    for subtopic in candidate_subtopics:
+        value = " ".join(str(subtopic).strip().split())
+        if not _study_subtopic_is_specific(value):
+            continue
+        key = value.lower()
+        if key in seen_local or key in used_subtopics:
+            continue
+        seen_local.add(key)
+        cleaned.append(value)
+        if len(cleaned) >= 5:
+            break
+
+    progression_bank = _subtopics_for_skill(skill_name, mode=mode, stage_index=occurrence_index)
+    for subtopic in progression_bank:
+        value = " ".join(str(subtopic).strip().split())
+        key = value.lower()
+        if key in seen_local or key in used_subtopics:
+            continue
+        seen_local.add(key)
+        cleaned.append(value)
+        if len(cleaned) >= 5:
+            break
+
+    if len(cleaned) < 3:
+        next_bank = _subtopics_for_skill(skill_name, mode=mode, stage_index=occurrence_index + 1)
+        for subtopic in next_bank:
+            value = " ".join(str(subtopic).strip().split())
+            key = value.lower()
+            if key in seen_local or key in used_subtopics:
+                continue
+            seen_local.add(key)
+            cleaned.append(value)
+            if len(cleaned) >= 3:
+                break
+
+    for item in cleaned:
+        used_subtopics.add(item.lower())
+
+    return cleaned
 
 
 def _safe_int(value, default: int) -> int:
@@ -2096,6 +2735,180 @@ def _classify_ai_generation_error(exc: Exception) -> str:
     return "ai_unavailable:model_unavailable"
 
 
+GENERIC_STUDY_SUBTOPIC_PATTERNS = [
+    r"^core concepts of\b",
+    r"^hands-on basics in\b",
+    r"^common mistakes and best practices in\b",
+    r"^advanced patterns in\b",
+    r"^performance and debugging in\b",
+    r"^interview-style problem solving with\b",
+    r"^foundation:?\b",
+    r"^practice:?\b",
+    r"^gap fill:?\b",
+]
+
+
+GENERIC_STUDY_TOPIC_PATTERNS = [
+    r"^foundation:?\b",
+    r"^practice:?\b",
+    r"^gap fill:?\b",
+    r"^study\b",
+    r"^review\b",
+]
+
+
+def _study_subtopic_is_specific(value: str) -> bool:
+    normalized = " ".join(str(value).strip().split())
+    if len(normalized) < 4:
+        return False
+
+    lowered = normalized.lower()
+    for pattern in GENERIC_STUDY_SUBTOPIC_PATTERNS:
+        if re.match(pattern, lowered):
+            return False
+
+    return True
+
+
+def _normalize_topic_name_key(value: str) -> str:
+    normalized = " ".join(str(value).strip().lower().split())
+    normalized = re.sub(r"[^a-z0-9\s]", "", normalized)
+    return normalized
+
+
+def _study_topic_name_is_specific(value: str) -> bool:
+    normalized = " ".join(str(value).strip().split())
+    if len(normalized) < 4:
+        return False
+
+    lowered = normalized.lower()
+    for pattern in GENERIC_STUDY_TOPIC_PATTERNS:
+        if re.match(pattern, lowered):
+            return False
+
+    return True
+
+
+def _resource_url_is_generic_search(url: str) -> bool:
+    lowered = str(url).strip().lower()
+    generic_search_signals = [
+        "youtube.com/results",
+        "google.com/search",
+        "bing.com/search",
+        "search.yahoo.com/search",
+        "freecodecamp.org/news/search",
+    ]
+    return any(signal in lowered for signal in generic_search_signals)
+
+
+def _study_plan_uses_day_numbers(total_days: int) -> bool:
+    return total_days <= 7
+
+
+def _study_plan_target_entry_count(total_days: int) -> int:
+    if _study_plan_uses_day_numbers(total_days):
+        return max(1, total_days)
+    return MAX_STUDY_PLAN_ENTRIES
+
+
+def _supplement_topic_resources(skill_name: str, resources: list[dict], seen_resource_urls: set[str]) -> list[dict]:
+    cleaned_resources = list(resources)
+    for resource in _free_resources_for_skill(skill_name):
+        title = " ".join(str(resource.get("title", "")).strip().split())
+        url = " ".join(str(resource.get("url", "")).strip().split())
+        rtype = " ".join(str(resource.get("type", "resource")).strip().split()) or "resource"
+        if not title or not url or not url.startswith("http"):
+            continue
+        if _resource_url_is_generic_search(url):
+            continue
+        url_key = url.lower()
+        if url_key in seen_resource_urls:
+            continue
+        seen_resource_urls.add(url_key)
+        cleaned_resources.append({"title": title, "url": url, "type": rtype})
+        if len(cleaned_resources) >= 3:
+            break
+
+    has_video = any(str(item.get("type", "")).lower() == "video" or "youtube.com" in str(item.get("url", "")).lower() for item in cleaned_resources)
+    if not has_video:
+        canonical = _canonical_skill_label(skill_name)
+        video_candidates = VIDEO_RESOURCES_BY_SKILL.get(canonical, [])
+
+        for resource in video_candidates:
+            title = " ".join(str(resource.get("title", "")).strip().split())
+            url = " ".join(str(resource.get("url", "")).strip().split())
+            if not title or not url or not url.startswith("http"):
+                continue
+            url_key = url.lower()
+            if url_key in seen_resource_urls:
+                continue
+            seen_resource_urls.add(url_key)
+            cleaned_resources.append({"title": title, "url": url, "type": "video"})
+            has_video = True
+            break
+
+    if not has_video:
+        canonical = _canonical_skill_label(skill_name)
+        query = canonical.replace(" ", "+")
+        url = f"https://www.youtube.com/results?search_query={query}+tutorial"
+        url_key = url.lower()
+        if url_key not in seen_resource_urls:
+            seen_resource_urls.add(url_key)
+            cleaned_resources.append(
+                {
+                    "title": f"YouTube: {canonical} tutorial",
+                    "url": url,
+                    "type": "video",
+                }
+            )
+    return cleaned_resources
+
+
+def _build_suggested_videos(topics: list[dict], skills: list[dict]) -> list[dict]:
+    suggestions = []
+    seen_urls = set()
+
+    for topic in topics:
+        for resource in topic.get("resources", []):
+            url = str(resource.get("url", "")).strip()
+            if "youtube.com" not in url.lower() and "youtu.be" not in url.lower():
+                continue
+            key = url.lower()
+            if key in seen_urls:
+                continue
+            seen_urls.add(key)
+            suggestions.append(
+                {
+                    "skill_name": topic["skill_name"],
+                    "title": resource.get("title", f"{topic['skill_name']} video"),
+                    "url": url,
+                    "type": "video",
+                }
+            )
+
+    for skill in skills:
+        canonical = _canonical_skill_label(skill["skill_name"])
+        curated_resources = VIDEO_SUGGESTIONS_BY_SKILL.get(canonical, [])
+        if not curated_resources:
+            curated_resources = VIDEO_RESOURCES_BY_SKILL.get(canonical, [])
+        for resource in curated_resources:
+            url = str(resource["url"]).strip()
+            key = url.lower()
+            if key in seen_urls:
+                continue
+            seen_urls.add(key)
+            suggestions.append(
+                {
+                    "skill_name": canonical,
+                    "title": resource["title"],
+                    "url": url,
+                    "type": resource.get("type", "video"),
+                }
+            )
+
+    return suggestions[:4]
+
+
 def _study_weight_for_skill(skill: dict) -> float:
     category = str(skill.get("category", "")).lower()
     proficiency = skill.get("proficiency_score")
@@ -2117,66 +2930,64 @@ def _study_weight_for_skill(skill: dict) -> float:
     return round(0.55 + (gap * 1.1) + (priority_norm * 0.85), 3)
 
 
+def _estimated_hours_for_skill_topic(skill: dict, occurrence_index: int = 1) -> float:
+    category = str(skill.get("category", "")).lower()
+    proficiency = skill.get("proficiency_score")
+    raw_priority = skill.get("priority_weight")
+    priority_norm = max(0.0, min(1.0, (_safe_float(raw_priority, 1.0) - 1.0) / 4.0))
+
+    if category == "present":
+        if proficiency is None:
+            proficiency = 0.5
+        proficiency = max(0.0, min(1.0, _safe_float(proficiency, 0.5)))
+        gap = 1.0 - proficiency
+        hours = 1.0 + (gap * 3.2) + (priority_norm * 0.8)
+    else:
+        hours = 2.6 + (priority_norm * 0.6)
+
+    if occurrence_index > 1:
+        hours -= min(0.6, (occurrence_index - 1) * 0.2)
+
+    return round(max(1.0, min(5.0, hours)), 2)
+
+
 def _rebalance_topics_for_time_and_weight(topics: list[dict], skills: list[dict], total_days: int) -> list[dict]:
     if not topics:
         return topics
 
     skill_map = {int(s["id"]): s for s in skills}
-    slots_per_day = 2 if total_days >= 3 else 1
-    max_topics = max(1, total_days * slots_per_day)
+    max_topics = _study_plan_target_entry_count(total_days)
+    use_day_numbers = _study_plan_uses_day_numbers(total_days)
 
     # Attach score-driven rank hints.
     ranked = []
-    for topic in topics:
+    for idx, topic in enumerate(topics):
         skill = skill_map.get(int(topic["skill_id"]))
         weight = _study_weight_for_skill(skill) if skill else 1.0
         category = str((skill or {}).get("category", "")).lower()
         boost = 1.0
         if category == "present":
             boost = 1.15
-        ranked.append((weight * boost, topic))
+        ranked.append((weight * boost, idx, topic))
 
     ranked.sort(key=lambda x: x[0], reverse=True)
 
-    # Keep the strongest weighted topics if model returns too many.
-    trimmed = [item[1] for item in ranked[:max_topics]]
+    # Keep strongest weighted topics, then restore original order to preserve progression.
+    trimmed_with_index = ranked[:max_topics]
+    trimmed_with_index.sort(key=lambda x: x[1])
+    trimmed = [item[2] for item in trimmed_with_index]
 
-    # If model returns too few topics for available days, duplicate weak areas first.
-    while len(trimmed) < min(max_topics, max(1, total_days)):
-        source = ranked[len(trimmed) % len(ranked)][1]
-        clone = dict(source)
-        clone["topic_name"] = f"{source['topic_name']} (Review)"
-        trimmed.append(clone)
+    ordered = list(trimmed)
 
-    # Time budget scales with days left; cap excessive daily burden.
-    daily_hours = 2.5 if total_days > 3 else 2.0
-    total_budget = max(2.0, total_days * daily_hours)
-
-    current_total = sum(max(0.5, _safe_float(t.get("estimated_hours"), 1.5)) for t in trimmed)
-    if current_total <= 0:
-        current_total = float(len(trimmed))
-
-    scale = total_budget / current_total
-    for topic in trimmed:
-        base_hours = max(0.5, _safe_float(topic.get("estimated_hours"), 1.5))
-        topic["estimated_hours"] = round(max(0.75, min(4.0, base_hours * scale)), 2)
-
-    # Recompute order (weakest first) and spread across available days.
-    ordered = sorted(
-        trimmed,
-        key=lambda t: _study_weight_for_skill(skill_map.get(int(t["skill_id"]), {})),
-        reverse=True,
-    )
-
-    idx = 0
-    for day in range(1, total_days + 1):
-        for _ in range(slots_per_day):
-            if idx >= len(ordered):
-                break
-            ordered[idx]["day_number"] = day
-            idx += 1
-        if idx >= len(ordered):
-            break
+    skill_occurrences = {}
+    for idx, topic in enumerate(ordered, start=1):
+        skill_id = int(topic["skill_id"])
+        skill_occurrences[skill_id] = skill_occurrences.get(skill_id, 0) + 1
+        topic["estimated_hours"] = _estimated_hours_for_skill_topic(
+            skill_map.get(skill_id, {}),
+            occurrence_index=skill_occurrences[skill_id],
+        )
+        topic["day_number"] = idx if use_day_numbers else idx
 
     return ordered
 
@@ -2190,68 +3001,50 @@ def _fallback_generate_study_topics(skills: list[dict], total_days: int) -> list
         key=lambda x: x["proficiency_score"] if x["proficiency_score"] is not None else 0.5,
     )
 
-    seeds = []
-    for skill in lacking:
-        seeds.append(
-            {
-                "skill_id": skill["id"],
-                "skill_name": skill["skill_name"],
-                "topic_name": f"Foundation: {skill['skill_name']}",
-                "description": f"Build core concepts and terminology for {skill['skill_name']} from first principles.",
-                "subtopics": _subtopics_for_skill(skill["skill_name"], "foundation"),
-                "estimated_hours": 2.0,
-                "resources": _free_resources_for_skill(skill["skill_name"]),
-            }
-        )
-        seeds.append(
-            {
-                "skill_id": skill["id"],
-                "skill_name": skill["skill_name"],
-                "topic_name": f"Practice: {skill['skill_name']}",
-                "description": f"Complete a guided hands-on exercise for {skill['skill_name']} and note common mistakes.",
-                "subtopics": _subtopics_for_skill(skill["skill_name"], "foundation"),
-                "estimated_hours": 2.0,
-                "resources": _free_resources_for_skill(skill["skill_name"]),
-            }
-        )
-
-    for skill in present_sorted:
-        proficiency = skill["proficiency_score"] if skill["proficiency_score"] is not None else 0.5
-        gap_focus = "advanced" if proficiency >= 0.75 else "intermediate"
-        seeds.append(
-            {
-                "skill_id": skill["id"],
-                "skill_name": skill["skill_name"],
-                "topic_name": f"Gap Fill: {skill['skill_name']}",
-                "description": f"Target {gap_focus} gaps in {skill['skill_name']} based on assessment score and improve weak patterns.",
-                "subtopics": _subtopics_for_skill(skill["skill_name"], "gap"),
-                "estimated_hours": 1.5,
-                "resources": _free_resources_for_skill(skill["skill_name"]),
-            }
-        )
-
-    if not seeds:
+    ordered_skills = [*lacking, *present_sorted]
+    if not ordered_skills:
         return []
 
-    topics_per_day = 2 if total_days >= 3 else 1
-    required_topics = max(total_days, total_days * topics_per_day)
-
-    expanded = []
-    idx = 0
-    while len(expanded) < required_topics:
-        expanded.append(dict(seeds[idx % len(seeds)]))
-        idx += 1
-
+    required_topics = _study_plan_target_entry_count(total_days)
     scheduled = []
-    ptr = 0
-    for day in range(1, total_days + 1):
-        for _ in range(topics_per_day):
-            if ptr >= len(expanded):
-                break
-            topic = expanded[ptr]
-            ptr += 1
-            topic["day_number"] = day
-            scheduled.append(topic)
+    occurrence_by_skill = {}
+    used_subtopics_by_skill = {}
+
+    for idx in range(required_topics):
+        skill = ordered_skills[idx % len(ordered_skills)]
+        skill_id = int(skill["id"])
+        occurrence = occurrence_by_skill.get(skill_id, 0) + 1
+        occurrence_by_skill[skill_id] = occurrence
+
+        mode = _study_mode_for_occurrence(skill, occurrence)
+        used_subtopics = used_subtopics_by_skill.setdefault(skill_id, set())
+        subtopics = _ensure_progressive_subtopics(
+            skill_name=skill["skill_name"],
+            mode=mode,
+            occurrence_index=occurrence,
+            candidate_subtopics=[],
+            used_subtopics=used_subtopics,
+        )
+
+        topic_name = _topic_label_for_progression(skill["skill_name"], mode, occurrence)
+        description = (
+            f"Build stronger {skill['skill_name']} depth with targeted practice for this stage."
+            if mode == "gap"
+            else f"Establish {skill['skill_name']} fundamentals and apply them in short exercises."
+        )
+
+        scheduled.append(
+            {
+                "day_number": idx + 1,
+                "skill_id": skill_id,
+                "skill_name": skill["skill_name"],
+                "topic_name": topic_name,
+                "description": description,
+                "subtopics": subtopics,
+                "estimated_hours": _estimated_hours_for_skill_topic(skill, occurrence_index=occurrence),
+                "resources": _free_resources_for_skill(skill["skill_name"]),
+            }
+        )
 
     return scheduled
 
@@ -2262,13 +3055,20 @@ def _normalize_study_topics_from_ai(raw_topics: list[dict], skills: list[dict], 
 
     skill_name_map = {_canonical_skill_label(s["skill_name"]).lower(): s for s in skills}
     normalized = []
+    seen_resource_urls = set()
+    seen_topic_name_keys = set()
+    seen_subtopic_signatures_by_skill = {}
+    seen_subtopic_values_by_skill = {}
+    skill_occurrence_count = {}
+    use_day_numbers = _study_plan_uses_day_numbers(total_days)
+    target_entry_count = _study_plan_target_entry_count(total_days)
 
     for topic in raw_topics:
         if not isinstance(topic, dict):
             continue
 
-        day_number = _safe_int(topic.get("day_number", 1), 1)
-        day_number = max(1, min(total_days, day_number))
+        day_number = _safe_int(topic.get("day_number", len(normalized) + 1), len(normalized) + 1)
+        day_number = max(1, min(target_entry_count, day_number))
 
         skill_name = _clean_skill_value(topic.get("skill_name", ""))
         if not skill_name:
@@ -2282,6 +3082,11 @@ def _normalize_study_topics_from_ai(raw_topics: list[dict], skills: list[dict], 
         topic_name = _clean_skill_value(topic.get("topic_name", ""))
         if not topic_name:
             continue
+        if not _study_topic_name_is_specific(topic_name):
+            continue
+        topic_name_key = _normalize_topic_name_key(topic_name)
+        if not topic_name_key:
+            continue
 
         description = " ".join(str(topic.get("description", "")).strip().split())
         if not description:
@@ -2290,15 +3095,49 @@ def _normalize_study_topics_from_ai(raw_topics: list[dict], skills: list[dict], 
         raw_subtopics = topic.get("subtopics", [])
         if isinstance(raw_subtopics, str):
             raw_subtopics = [part.strip() for part in re.split(r"[,;\n]", raw_subtopics) if part.strip()]
-        cleaned_subtopics = []
-        for subtopic in list(raw_subtopics)[:6]:
-            value = " ".join(str(subtopic).strip().split())
-            if len(value) < 3:
-                continue
-            cleaned_subtopics.append(value)
+        skill_id = int(matched_skill["id"])
+        occurrence_index = skill_occurrence_count.get(skill_id, 0) + 1
+        mode = _study_mode_for_occurrence(matched_skill, occurrence_index)
+        used_subtopics = seen_subtopic_values_by_skill.setdefault(skill_id, set())
+        cleaned_subtopics = _ensure_progressive_subtopics(
+            skill_name=matched_skill["skill_name"],
+            mode=mode,
+            occurrence_index=occurrence_index,
+            candidate_subtopics=list(raw_subtopics)[:6],
+            used_subtopics=used_subtopics,
+        )
 
-        if not cleaned_subtopics:
+        if len(cleaned_subtopics) < 3:
             continue
+
+        subtopic_signature = tuple(sorted(item.lower() for item in cleaned_subtopics))
+        prior_signatures = seen_subtopic_signatures_by_skill.setdefault(skill_id, [])
+        if subtopic_signature in prior_signatures:
+            continue
+
+        skip_for_high_overlap = False
+        subtopic_set = set(subtopic_signature)
+        for prior_signature in prior_signatures:
+            prior_set = set(prior_signature)
+            overlap = len(subtopic_set & prior_set)
+            overlap_ratio = overlap / max(1, min(len(subtopic_set), len(prior_set)))
+            if overlap_ratio >= 0.67:
+                skip_for_high_overlap = True
+                break
+        if skip_for_high_overlap:
+            continue
+
+        if topic_name_key in seen_topic_name_keys:
+            topic_name = f"{topic_name} (Level {occurrence_index})"
+            topic_name_key = _normalize_topic_name_key(topic_name)
+            if not topic_name_key or topic_name_key in seen_topic_name_keys:
+                topic_name = _topic_label_for_progression(matched_skill["skill_name"], mode, occurrence_index)
+                topic_name_key = _normalize_topic_name_key(topic_name)
+                if not topic_name_key or topic_name_key in seen_topic_name_keys:
+                    topic_name = f"{matched_skill['skill_name']} Study Block {occurrence_index}"
+                    topic_name_key = _normalize_topic_name_key(topic_name)
+                    if not topic_name_key or topic_name_key in seen_topic_name_keys:
+                        continue
 
         estimated_hours = _safe_float(topic.get("estimated_hours", 1.5), 1.5)
         estimated_hours = max(0.5, min(6.0, estimated_hours))
@@ -2317,10 +3156,19 @@ def _normalize_study_topics_from_ai(raw_topics: list[dict], skills: list[dict], 
             rtype = " ".join(str(resource.get("type", "resource")).strip().split())
             if not title or not url or not url.startswith("http"):
                 continue
+            if _resource_url_is_generic_search(url):
+                continue
+            url_key = url.lower()
+            if url_key in seen_resource_urls:
+                continue
+            seen_resource_urls.add(url_key)
             cleaned_resources.append({"title": title, "url": url, "type": rtype or "resource"})
 
-        if not cleaned_resources:
-            continue
+        cleaned_resources = _supplement_topic_resources(matched_skill["skill_name"], cleaned_resources, seen_resource_urls)
+
+        seen_topic_name_keys.add(topic_name_key)
+        prior_signatures.append(subtopic_signature)
+        skill_occurrence_count[skill_id] = occurrence_index
 
         normalized.append(
             {
@@ -2338,7 +3186,14 @@ def _normalize_study_topics_from_ai(raw_topics: list[dict], skills: list[dict], 
     if not normalized:
         return []
 
+    min_topics_required = _study_plan_target_entry_count(total_days)
+    if len(normalized) < min_topics_required:
+        return []
+
     normalized.sort(key=lambda x: (x["day_number"], x["skill_name"], x["topic_name"]))
+    if not use_day_numbers:
+        for idx, topic in enumerate(normalized, start=1):
+            topic["day_number"] = idx
     return _rebalance_topics_for_time_and_weight(normalized, skills, total_days)
 
 
@@ -2355,18 +3210,37 @@ def _generate_study_topics_with_gemini(skills: list[dict], total_days: int) -> t
         }
         for s in skills
     ]
+    use_day_numbers = _study_plan_uses_day_numbers(total_days)
+    target_topic_count = _study_plan_target_entry_count(total_days)
+    numbering_instruction = (
+        f"- Use day_number values 1 through {target_topic_count}; create exactly one topic for each day."
+        if use_day_numbers
+        else "- Use day_number values 1 through 7 only as internal order. Do not phrase the plan as Day 1, Day 2, etc. Make each topic a study block or focus area."
+    )
 
     prompt = f"""
 You are creating a practical interview prep study plan.
 
 Constraints:
 - total_days: {total_days}
+- generate exactly {target_topic_count} topic objects
+- create one topic entry per item, not multiple entries per day
+{numbering_instruction}
+- Every topic_name must be unique across the whole plan.
 - Use lacking skills for foundational learning based on available time.
 - Use present skills for targeted weak-gap improvement based on proficiency_score and priority_weight.
-- Keep plan realistic: 1-2 topics per day.
-- For every topic include 3-5 concrete subtopics to study that day.
-- Prefer explicit subtopics such as async functions, decorators, multithreading (when relevant), APIs, indexing, etc.
-- Each topic must include free resources only.
+- Shape the sequence by time left: early entries for foundations, middle entries for applied work, final entries for interview revision, weak-area drills, and mock-style practice.
+- If the same skill appears more than once, later entries must clearly advance beyond earlier ones. Do not repeat the same topic_name or nearly the same subtopics for that skill.
+- For every topic include 3-5 concrete subtopics to study that exact day.
+- Subtopics must be specific concept names like "Data types", "Primary keys", "Window functions", "CASE statements", "Joins", "CTEs", "Indexes", "Transactions", "Async functions", or "Decorators", depending on the skill.
+- Do not output vague filler like "Core concepts of X", "Hands-on basics in X", "Common mistakes", "Advanced patterns", or "Best practices".
+- Do not reuse the same 2 or 3 subtopics across multiple entries for the same skill.
+- Set estimated_hours based on weakness: weaker assessed skills should get more time, stronger skills less time, and each entry must stay between 1 and 5 hours.
+- Each topic must include 1-3 free resources directly relevant to that day's subtopics.
+- Use direct links to docs, tutorials, articles, videos, or exercises.
+- Do not use generic search result pages.
+- Do not repeat the same URL across different days unless absolutely unavoidable.
+- Make resources differ across days so the learner is not seeing the same links repeated.
 - Output strict JSON only.
 
 Skills:
@@ -2399,8 +3273,7 @@ Return JSON format:
             last_reason = "ai_unavailable:timeout"
             break
         try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt, request_options={"timeout": 10})
+            response = _generate_gemini_content(model_name, prompt, timeout_seconds=10)
             parsed = _parse_json_object_from_model_text(response.text or "")
             if not parsed:
                 continue
@@ -2491,6 +3364,17 @@ def _study_plan_response(session_id: int) -> dict:
 
         cursor.execute(
             """
+            SELECT id AS skill_id, skill_name, category, proficiency_score, priority_weight
+            FROM skills
+            WHERE session_id = ?
+            ORDER BY category ASC, priority_weight DESC, skill_name ASC
+            """,
+            (session_id,),
+        )
+        session_skill_rows = [dict(row) for row in cursor.fetchall()]
+
+        cursor.execute(
+            """
             SELECT
                 st.id,
                 st.skill_id,
@@ -2558,25 +3442,15 @@ def _study_plan_response(session_id: int) -> dict:
         {"day_number": day, "topics": days[day]} for day in sorted(days.keys())
     ]
 
-    skill_map = {}
-    for topic in topics:
-        sid = topic["skill_id"]
-        if sid in skill_map:
-            continue
-        skill_map[sid] = {
-            "skill_id": sid,
-            "skill_name": topic["skill_name"],
-            "category": topic["category"],
-            "proficiency_score": topic["proficiency_score"],
-            "priority_weight": topic["priority_weight"],
-        }
-
+    skill_map = {int(skill["skill_id"]): skill for skill in session_skill_rows}
     present = [s for s in skill_map.values() if s["category"] == "present"]
     lacking = [s for s in skill_map.values() if s["category"] == "lacking"]
 
     total_topics = len(topics)
     progress_percent = 0 if total_topics == 0 else round((completed_count / total_topics) * 100, 2)
     days_remaining = _days_until(session["interview_date"]) if session["interview_date"] else None
+    plan_mode = "daily" if _study_plan_uses_day_numbers(plan["total_days"]) else "focus"
+    suggested_videos = _build_suggested_videos(topics, session_skill_rows)
 
     return {
         "session_id": session_id,
@@ -2588,7 +3462,10 @@ def _study_plan_response(session_id: int) -> dict:
         "total_topics": total_topics,
         "completed_topics": completed_count,
         "progress_percent": progress_percent,
+        "plan_mode": plan_mode,
         "day_groups": day_groups,
+        "focus_topics": topics if plan_mode == "focus" else [],
+        "suggested_videos": suggested_videos,
         "skill_breakdown": {
             "present": sorted(present, key=lambda x: x["skill_name"].lower()),
             "lacking": sorted(lacking, key=lambda x: x["skill_name"].lower()),
@@ -2634,13 +3511,22 @@ async def generate_module4_plan(session_id: int):
             raise HTTPException(
                 status_code=503,
                 detail=(
-                    "Study plan generation is currently unavailable. "
+                    "AI study plan generation is currently unavailable. "
                     "Retry shortly; if this persists, verify GEMINI_API_KEY/model/quota settings."
                 ),
             )
         generation_engine = f"fallback:{generation_engine}"
 
     _save_study_plan(session_id, total_days, topics, generation_engine)
+
+    # Pre-generate the final test so the user can open it instantly from the plan page.
+    try:
+        questions, test_engine = _generate_final_practice_test_questions(session_id)
+        if questions is not None:
+            _save_final_practice_test(session_id, questions, test_engine)
+    except Exception:
+        # Plan generation should still succeed even if practice test pre-generation fails.
+        pass
 
     response = _study_plan_response(session_id)
     response["generation_engine"] = generation_engine
@@ -2667,6 +3553,33 @@ async def update_module4_topic_completion(topic_id: int, payload: TopicCompletio
             (topic_id,),
         )
         row = cursor.fetchone()
+        if row is None and (payload.plan_id is not None or payload.topic_name):
+            conditions = ["sp.id = ?"]
+            params: list[object] = [payload.plan_id or -1]
+
+            if payload.topic_name:
+                conditions.append("LOWER(st.topic_name) = LOWER(?)")
+                params.append(payload.topic_name)
+            if payload.skill_id is not None:
+                conditions.append("st.skill_id = ?")
+                params.append(payload.skill_id)
+            if payload.day_number is not None:
+                conditions.append("st.day_number = ?")
+                params.append(payload.day_number)
+
+            cursor.execute(
+                f"""
+                SELECT st.id, sp.session_id
+                FROM study_topics st
+                JOIN study_plans sp ON sp.id = st.plan_id
+                WHERE {' AND '.join(conditions)}
+                ORDER BY st.day_number ASC, st.id ASC
+                LIMIT 1
+                """,
+                params,
+            )
+            row = cursor.fetchone()
+
         if row is None:
             raise HTTPException(status_code=404, detail="Study topic not found.")
 
@@ -2683,4 +3596,607 @@ async def update_module4_topic_completion(topic_id: int, payload: TopicCompletio
         "topic_id": topic_id,
         "is_completed": payload.is_completed,
         "plan": _study_plan_response(session_id),
+    }
+
+
+def _parse_practice_test_json(raw_text: str) -> list[dict]:
+    parsed = _parse_json_object_from_model_text(raw_text)
+    if not parsed:
+        return []
+    questions = parsed.get("questions", [])
+    return questions if isinstance(questions, list) else []
+
+
+def _normalize_practice_test_questions(raw_questions: list[dict]) -> list[dict]:
+    normalized = []
+    seen_questions = set()
+
+    for idx, item in enumerate(raw_questions, start=1):
+        if not isinstance(item, dict):
+            continue
+
+        question_text = " ".join(str(item.get("question_text", "")).strip().split())
+        if len(question_text) < 12:
+            continue
+
+        question_key = question_text.lower()
+        if question_key in seen_questions:
+            continue
+
+        options = item.get("options", [])
+        if not isinstance(options, list):
+            continue
+        cleaned_options = []
+        seen_options = set()
+        for option in options:
+            value = " ".join(str(option).strip().split())
+            key = value.lower()
+            if len(value) < 2 or key in seen_options:
+                continue
+            seen_options.add(key)
+            cleaned_options.append(value)
+
+        if len(cleaned_options) != 4:
+            continue
+
+        correct_option_index = _safe_int(item.get("correct_option_index", 0), 0)
+        if correct_option_index < 1 or correct_option_index > 4:
+            continue
+
+        skill_name = " ".join(str(item.get("skill_name", "")).strip().split())
+        topic_name = " ".join(str(item.get("topic_name", "")).strip().split())
+
+        normalized.append(
+            {
+                "question_index": len(normalized) + 1,
+                "skill_name": skill_name,
+                "topic_name": topic_name,
+                "question_text": question_text,
+                "options": cleaned_options,
+                "correct_option_index": correct_option_index,
+            }
+        )
+        seen_questions.add(question_key)
+
+        if len(normalized) >= 10:
+            break
+
+    return normalized
+
+
+def _practice_test_questions_are_too_repetitive(questions: list[dict]) -> bool:
+    if len(questions) < 10:
+        return True
+
+    question_text_keys = set()
+    topic_keys = set()
+    for question in questions:
+        question_text = _clean_skill_value(question.get("question_text", "")).lower()
+        topic_name = _clean_skill_value(question.get("topic_name", "")).lower()
+        if question_text:
+            question_text_keys.add(question_text)
+        if topic_name:
+            topic_keys.add(topic_name)
+
+    if len(question_text_keys) < 8:
+        return True
+    if len(topic_keys) < 4:
+        return True
+    return False
+
+
+def _practice_test_key_candidates() -> list[str]:
+    ordered_unique = []
+    seen = set()
+    for key in [PRACTICE_TEST_GEMINI_API_KEY, QUESTION_GEMINI_API_KEY, GEMINI_API_KEY]:
+        normalized = (key or "").strip()
+        if not normalized:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered_unique.append(normalized)
+    return ordered_unique
+
+
+def _split_round_robin(items: list[dict], bucket_count: int) -> list[list[dict]]:
+    bucket_count = max(1, bucket_count)
+    buckets = [[] for _ in range(bucket_count)]
+    for index, item in enumerate(items):
+        buckets[index % bucket_count].append(item)
+    return buckets
+
+
+def _generate_practice_test_batch_questions(
+    api_key: str,
+    skills: list[dict],
+    topic_slice: list[dict],
+    target_count: int,
+    used_question_texts: set[str],
+    used_topic_names: set[str],
+    batch_label: str,
+) -> list[dict]:
+    if not api_key or target_count <= 0:
+        return []
+
+    prompt = f"""
+You are generating a subset of a final mixed interview practice test.
+
+Requirements:
+- Generate exactly {target_count} multiple choice questions.
+- Use only the skills and topics in this batch.
+- Every question must have exactly 4 topic related options.
+- Exactly one correct option per question.
+- Questions must be distinct from any previously generated questions.
+- Do not repeat the same topic_name or question_text.
+- Keep language clear and concise.
+- Output strict JSON only.
+
+Batch label: {batch_label}
+
+Already generated question texts:
+{json.dumps(sorted(used_question_texts))}
+
+Already used topic names:
+{json.dumps(sorted(used_topic_names))}
+
+Skills context:
+{json.dumps(skills)}
+
+Topic batch context:
+{json.dumps(topic_slice)}
+
+Return format:
+{{
+  "questions": [
+    {{
+      "skill_name": "Python",
+      "topic_name": "Async API patterns",
+      "question_text": "Which statement about ... is correct?",
+      "options": ["Option A", "Option B", "Option C", "Option D"],
+      "correct_option_index": 2
+    }}
+  ]
+}}
+"""
+
+    last_reason = "ai_unavailable:model_unavailable"
+    for model_name in _get_model_candidates():
+        try:
+            response = _generate_gemini_content(
+                model_name,
+                prompt,
+                timeout_seconds=14,
+                api_key=api_key,
+            )
+            raw_questions = _parse_practice_test_json(response.text or "")
+            normalized = _normalize_practice_test_questions(raw_questions)
+            filtered = []
+            for question in normalized:
+                question_key = _normalize_topic_name_key(question.get("question_text", ""))
+                topic_key = _normalize_topic_name_key(question.get("topic_name", ""))
+                if not question_key or question_key in used_question_texts:
+                    continue
+                if topic_key and topic_key in used_topic_names:
+                    continue
+                filtered.append(question)
+
+            if filtered:
+                return filtered
+        except Exception as exc:
+            last_reason = _classify_ai_generation_error(exc)
+            continue
+
+    return []
+
+
+def _build_fallback_final_practice_test_questions(skills: list[dict], topic_context: list[dict]) -> list[dict]:
+    if not skills:
+        return []
+
+    topic_pool = []
+    for item in topic_context:
+        topic_name = _clean_skill_value(item.get("topic_name", ""))
+        for subtopic in item.get("subtopics", []) or []:
+            value = _clean_skill_value(subtopic)
+            if value:
+                topic_pool.append(value)
+        if topic_name:
+            topic_pool.append(topic_name)
+
+    if not topic_pool:
+        topic_pool = [_clean_skill_value(skill["skill_name"]) for skill in skills if _clean_skill_value(skill.get("skill_name", ""))]
+
+    topic_pool = [value for value in _normalized_unique(topic_pool) if value]
+
+    generic_distractors = [
+        "Primary key relationships",
+        "Caching strategy",
+        "Error handling",
+        "Concurrency model",
+        "State management",
+        "Input validation",
+        "Transactions",
+        "Index usage",
+        "API routing",
+        "Testing strategy",
+        "Deployment setup",
+        "Performance tuning",
+    ]
+
+    templates = [
+        "Which statement best describes {focus} in {topic_name}?",
+        "What is the main purpose of {focus} when studying {topic_name}?",
+        "Which scenario most directly uses {focus} in {topic_name}?",
+        "Which option is the best example of {focus} for {topic_name}?",
+        "How would you explain {focus} in the context of {topic_name}?",
+        "Which choice is closest to the correct approach for {topic_name} and {focus}?",
+        "What is the most likely interview takeaway from {focus} in {topic_name}?",
+        "Which answer best matches the role of {focus} here: {topic_name}?",
+        "Which of these is the strongest description of {focus} for {topic_name}?",
+        "What does {focus} contribute to {topic_name}?",
+    ]
+
+    questions = []
+    seen_question_texts = set()
+    for idx in range(10):
+        topic = topic_context[idx % len(topic_context)] if topic_context else {"skill_name": skills[idx % len(skills)]["skill_name"], "topic_name": skills[idx % len(skills)]["skill_name"], "subtopics": []}
+        skill_name = _clean_skill_value(topic.get("skill_name", "")) or _clean_skill_value(skills[idx % len(skills)]["skill_name"])
+        topic_name = _clean_skill_value(topic.get("topic_name", "")) or skill_name
+
+        subtopics = []
+        for subtopic in topic.get("subtopics", []) or []:
+            value = _clean_skill_value(subtopic)
+            if value and value.lower() not in {item.lower() for item in subtopics}:
+                subtopics.append(value)
+
+        focus = subtopics[idx % len(subtopics)] if subtopics else f"Core idea in {topic_name}"
+        correct_answer = focus
+
+        distractors = []
+        for candidate in [*topic_pool, *generic_distractors]:
+            if candidate.lower() == correct_answer.lower():
+                continue
+            if candidate.lower() in {item.lower() for item in distractors}:
+                continue
+            distractors.append(candidate)
+            if len(distractors) >= 3:
+                break
+
+        while len(distractors) < 3:
+            fallback_value = f"Alternative concept {len(distractors) + 1}"
+            if fallback_value.lower() != correct_answer.lower() and fallback_value.lower() not in {item.lower() for item in distractors}:
+                distractors.append(fallback_value)
+
+        options = [correct_answer, *distractors[:3]]
+        random.shuffle(options)
+        correct_option_index = options.index(correct_answer) + 1
+
+        question_text = templates[idx % len(templates)].format(focus=focus, topic_name=topic_name)
+        suffix = 2
+        base_question_text = question_text
+        while question_text.lower() in seen_question_texts:
+            question_text = f"{base_question_text} (set {suffix})"
+            suffix += 1
+        seen_question_texts.add(question_text.lower())
+
+        questions.append(
+            {
+                "question_index": idx + 1,
+                "skill_name": skill_name,
+                "topic_name": topic_name,
+                "question_text": question_text,
+                "options": options,
+                "correct_option_index": correct_option_index,
+            }
+        )
+
+    return questions
+
+
+def _generate_final_practice_test_questions(session_id: int) -> tuple[list[dict] | None, str]:
+    api_keys = _practice_test_key_candidates()
+    if not api_keys:
+        return None, "ai_unavailable:no_practice_test_api_key"
+    last_reason = "ai_unavailable:model_unavailable"
+
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT skill_name, category, proficiency_score, priority_weight
+            FROM skills
+            WHERE session_id = ?
+            ORDER BY category ASC, priority_weight DESC, skill_name ASC
+            """,
+            (session_id,),
+        )
+        skills = [dict(row) for row in cursor.fetchall()]
+
+        cursor.execute(
+            """
+            SELECT s.skill_name, st.topic_name, st.subtopics
+            FROM study_topics st
+            JOIN study_plans sp ON sp.id = st.plan_id
+            JOIN skills s ON s.id = st.skill_id
+            WHERE sp.session_id = ?
+            ORDER BY st.day_number ASC, st.id ASC
+            """,
+            (session_id,),
+        )
+        topic_rows = cursor.fetchall()
+    finally:
+        conn.close()
+
+    if not skills:
+        return None, "ai_unavailable:no_skills"
+
+    topic_context = []
+    for row in topic_rows:
+        subtopics = []
+        try:
+            subtopics = json.loads(row["subtopics"] or "[]")
+        except Exception:
+            subtopics = []
+        topic_context.append(
+            {
+                "skill_name": row["skill_name"],
+                "topic_name": row["topic_name"],
+                "subtopics": subtopics,
+            }
+        )
+
+    topic_batches = _split_round_robin(topic_context, len(api_keys))
+    if not topic_batches:
+        topic_batches = [[] for _ in api_keys]
+
+    collected = []
+    used_question_texts = set()
+    used_topic_names = set()
+    base_target = 10 // len(api_keys)
+    remainder = 10 % len(api_keys)
+
+    for index, api_key in enumerate(api_keys):
+        batch_target = base_target + (1 if index < remainder else 0)
+        topic_slice = topic_batches[index] if index < len(topic_batches) else []
+        batch_questions = _generate_practice_test_batch_questions(
+            api_key=api_key,
+            skills=skills,
+            topic_slice=topic_slice,
+            target_count=batch_target,
+            used_question_texts=used_question_texts,
+            used_topic_names=used_topic_names,
+            batch_label=f"batch-{index + 1}",
+        )
+
+        for question in batch_questions:
+            question_key = _normalize_topic_name_key(question.get("question_text", ""))
+            topic_key = _normalize_topic_name_key(question.get("topic_name", ""))
+            if not question_key or question_key in used_question_texts:
+                continue
+            if topic_key and topic_key in used_topic_names:
+                continue
+            used_question_texts.add(question_key)
+            if topic_key:
+                used_topic_names.add(topic_key)
+            collected.append(question)
+
+        if len(collected) >= 10:
+            break
+
+    if len(collected) >= 10:
+        normalized = collected[:10]
+        if not _practice_test_questions_are_too_repetitive(normalized):
+            for idx, question in enumerate(normalized, start=1):
+                question["question_index"] = idx
+            return normalized, "ai:multi-key"
+
+    fallback_questions = _build_fallback_final_practice_test_questions(skills, topic_context)
+    if len(fallback_questions) == 10:
+        return fallback_questions, f"fallback:{last_reason}"
+
+    return None, last_reason
+
+
+def _save_final_practice_test(session_id: int, questions: list[dict], generation_engine: str) -> int:
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT id FROM practice_tests WHERE session_id = ?", (session_id,))
+        existing = cursor.fetchone()
+        if existing:
+            test_id = int(existing["id"])
+            cursor.execute("DELETE FROM practice_test_questions WHERE test_id = ?", (test_id,))
+            cursor.execute(
+                """
+                UPDATE practice_tests
+                SET total_questions = ?, score_percent = NULL, submitted_at = NULL, created_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (len(questions), test_id),
+            )
+        else:
+            cursor.execute(
+                "INSERT INTO practice_tests (session_id, total_questions) VALUES (?, ?)",
+                (session_id, len(questions)),
+            )
+            test_id = int(cursor.lastrowid)
+
+        for question in questions:
+            cursor.execute(
+                """
+                INSERT INTO practice_test_questions (
+                    test_id,
+                    question_index,
+                    skill_name,
+                    topic_name,
+                    question_text,
+                    options,
+                    correct_option_index
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    test_id,
+                    question["question_index"],
+                    question.get("skill_name", ""),
+                    question.get("topic_name", ""),
+                    question["question_text"],
+                    json.dumps(question["options"]),
+                    question["correct_option_index"],
+                ),
+            )
+
+        cursor.execute("UPDATE sessions SET status = ? WHERE id = ?", ("practice_test_ready", session_id))
+        conn.commit()
+        return test_id
+    finally:
+        conn.close()
+
+
+def _practice_test_response(session_id: int) -> dict:
+    session = _get_session_by_id(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found.")
+
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, total_questions, score_percent, submitted_at, created_at FROM practice_tests WHERE session_id = ?",
+            (session_id,),
+        )
+        test = cursor.fetchone()
+        if test is None:
+            raise HTTPException(status_code=404, detail="Practice test not found.")
+
+        cursor.execute(
+            """
+            SELECT id, question_index, skill_name, topic_name, question_text, options
+            FROM practice_test_questions
+            WHERE test_id = ?
+            ORDER BY question_index ASC, id ASC
+            """,
+            (test["id"],),
+        )
+        question_rows = cursor.fetchall()
+    finally:
+        conn.close()
+
+    questions = []
+    for row in question_rows:
+        options = []
+        try:
+            options = json.loads(row["options"] or "[]")
+        except Exception:
+            options = []
+        questions.append(
+            {
+                "id": row["id"],
+                "question_index": row["question_index"],
+                "skill_name": row["skill_name"],
+                "topic_name": row["topic_name"],
+                "question_text": row["question_text"],
+                "options": options,
+            }
+        )
+
+    return {
+        "session_id": session_id,
+        "test_id": int(test["id"]),
+        "total_questions": int(test["total_questions"] or len(questions) or 10),
+        "created_at": test["created_at"],
+        "submitted_at": test["submitted_at"],
+        "is_submitted": test["submitted_at"] is not None,
+        "score_percent": test["score_percent"],
+        "questions": questions,
+    }
+
+
+@app.post("/api/module5/sessions/{session_id}/generate-test")
+async def generate_module5_final_test(session_id: int):
+    session = _get_session_by_id(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found.")
+
+    plan = _study_plan_response(session_id)
+    if (plan.get("progress_percent") or 0) < 100:
+        raise HTTPException(status_code=400, detail="Complete 100% of the study plan before taking the practice test.")
+
+    questions, generation_engine = _generate_final_practice_test_questions(session_id)
+    if questions is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "AI practice test generation is currently unavailable. "
+                "Set PRACTICE_TEST_GEMINI_API_KEY (or reuse an existing Gemini key) and verify model/quota settings."
+            ),
+        )
+
+    _save_final_practice_test(session_id, questions, generation_engine)
+    response = _practice_test_response(session_id)
+    response["generation_engine"] = generation_engine
+    return response
+
+
+@app.get("/api/module5/sessions/{session_id}/test")
+async def get_module5_final_test(session_id: int):
+    return _practice_test_response(session_id)
+
+
+@app.post("/api/module5/tests/{test_id}/submit")
+async def submit_module5_final_test(test_id: int, payload: PracticeTestSubmission):
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, session_id FROM practice_tests WHERE id = ?", (test_id,))
+        test = cursor.fetchone()
+        if test is None:
+            raise HTTPException(status_code=404, detail="Practice test not found.")
+
+        cursor.execute(
+            "SELECT id, correct_option_index FROM practice_test_questions WHERE test_id = ?",
+            (test_id,),
+        )
+        question_rows = cursor.fetchall()
+        if not question_rows:
+            raise HTTPException(status_code=400, detail="No questions found for this test.")
+
+        correct_by_question = {int(row["id"]): int(row["correct_option_index"]) for row in question_rows}
+        total_questions = len(correct_by_question)
+
+        answer_map = {}
+        for answer in payload.answers:
+            selected = _safe_int(answer.selected_option_index, 0)
+            if selected < 1 or selected > 4:
+                raise HTTPException(status_code=400, detail="Selected option index must be between 1 and 4.")
+            answer_map[int(answer.question_id)] = selected
+
+        if len(answer_map) != total_questions:
+            raise HTTPException(status_code=400, detail="Submit answers for all test questions.")
+
+        if set(answer_map.keys()) != set(correct_by_question.keys()):
+            raise HTTPException(status_code=400, detail="Answer set does not match the generated test questions.")
+
+        correct_count = sum(1 for qid, selected in answer_map.items() if selected == correct_by_question[qid])
+        score_percent = round((correct_count / total_questions) * 100, 2)
+
+        cursor.execute(
+            "UPDATE practice_tests SET score_percent = ?, submitted_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (score_percent, test_id),
+        )
+        cursor.execute("UPDATE sessions SET status = ? WHERE id = ?", ("practice_test_completed", test["session_id"]))
+        conn.commit()
+        session_id = int(test["session_id"])
+    finally:
+        conn.close()
+
+    return {
+        "test_id": test_id,
+        "session_id": session_id,
+        "correct_count": correct_count,
+        "total_questions": total_questions,
+        "score_percent": score_percent,
+        "test": _practice_test_response(session_id),
     }

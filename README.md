@@ -1,156 +1,318 @@
-# SkillBridge — AI Skill Assessment & Personalised Learning Agent
+# SkillBridge: AI Skill Assessment and Interview Prep Agent
+
+SkillBridge is an end-to-end interview preparation application that:
+1. extracts present and lacking skills from resume plus job description,
+2. runs a skill assessment with AI-generated MCQ questions,
+3. builds a progressive study plan up to interview day,
+4. tracks topic completion,
+5. generates a final 10-question mixed practice test.
+
+The project has a FastAPI backend, a React/Vite frontend, and a local SQLite database.
+
+## What This Project Does
+
+### Module 2: Skill Extraction
+1. Accepts resume text and/or resume PDF.
+2. Accepts job description and interview date.
+3. Uses Gemini to classify skills into:
+   - present skills
+   - lacking skills
+4. Saves session and skills in SQLite.
+
+### Module 3: Proficiency Assessment
+1. Generates assessment questions for present skills.
+2. Runs one-question-at-a-time MCQ flow.
+3. Scores each answer and stores feedback.
+4. Recalculates per-skill proficiency and priority weight.
+
+### Module 4: Study Plan Generator
+1. Builds a day-wise or focus-block plan based on time to interview.
+2. Balances entries by skill weakness and category.
+3. Adds subtopics and learning resources.
+4. Tracks completion via topic checkboxes.
+
+### Module 5: Final Practice Test
+1. Requires 100% study-plan completion.
+2. Pre-generates and/or generates a 10-question mixed test.
+3. Uses multi-key Gemini batching to improve diversity.
+4. Scores submission and stores final percentage.
 
 ## Tech Stack
-- **Backend**: Python + FastAPI + SQLite
-- **Frontend**: React + Vite
-- **AI**: Google Gemini 1.5 Flash (free tier)
-- **DB**: SQLite (no setup needed, file-based)
 
----
+- Backend: FastAPI, Pydantic, SQLite
+- Frontend: React 18, Vite, Axios
+- AI: Google Gemini (gemini-1.5-flash-latest)
+- Runtime: Python 3.10+ recommended, Node.js 18+ recommended
 
-## ⚡ One-Time Setup (Windows)
+## Repository Layout
 
-### 1. Get Your Free Gemini API Key
-1. Go to → https://aistudio.google.com/app/apikey
-2. Sign in with Google → Click "Create API Key"
-3. Copy the key
-
-### 2. Set Up the Backend
-
-Open **Command Prompt** or **PowerShell** in the project folder:
-
-```bash
-cd skill-assessment-agent\backend
-
-# Create virtual environment
-python -m venv venv
-
-# Activate it (Command Prompt)
-venv\Scripts\activate.bat
-
-# OR activate it (PowerShell)
-venv\Scripts\Activate.ps1
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Add your API key
-# Open backend\.env and replace: your_gemini_api_key_here → your actual key
+```
+code/
+|-- backend/
+|   |-- main.py
+|   |-- database.py
+|   |-- config.py
+|   |-- requirements.txt
+|   |-- .env.example
+|   `-- assessment.db            # created at runtime
+|-- frontend/
+|   |-- package.json
+|   |-- index.html
+|   |-- vite.config.js
+|   `-- src/
+|       |-- App.jsx
+|       |-- main.jsx
+|       `-- index.css
+|-- checkpoint_module3_stable_2026-04-26/
+`-- README.md
 ```
 
-### 3. Set Up the Frontend
+## API Summary
 
-Open a **second** terminal:
+- `GET /` and `GET /health`
+- `POST /api/module2/extract-skills`
+- `GET /api/sessions/{session_id}/skills`
+- `POST /api/module3/sessions/{session_id}/start-assessment`
+- `GET /api/module3/sessions/{session_id}/next-question`
+- `POST /api/module3/questions/{question_id}/answer`
+- `GET /api/module3/sessions/{session_id}/summary`
+- `POST /api/module4/sessions/{session_id}/generate-plan`
+- `GET /api/module4/sessions/{session_id}/plan`
+- `PATCH /api/module4/topics/{topic_id}/completion`
+- `POST /api/module5/sessions/{session_id}/generate-test`
+- `GET /api/module5/sessions/{session_id}/test`
+- `POST /api/module5/tests/{test_id}/submit`
 
-```bash
-cd skill-assessment-agent\frontend
+## Environment Variables
 
-# Install Node dependencies
+Create `backend/.env` from `backend/.env.example`.
+
+Required/used keys:
+- `GEMINI_API_KEY`
+- `QUESTION_GEMINI_API_KEY`
+- `PRACTICE_TEST_GEMINI_API_KEY`
+- `ALLOWED_ORIGINS` (comma-separated frontend URLs allowed by CORS)
+
+You can reuse the same key in all three variables, or use separate keys to spread quota usage.
+
+## Local Setup (Windows)
+
+### 1. Backend setup
+
+From project root:
+
+```powershell
+cd backend
+python -m venv ..\.venv
+..\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+copy .env.example .env
+```
+
+Then open `backend/.env` and add your Gemini keys.
+
+### 2. Frontend setup
+
+From project root in a second terminal:
+
+```powershell
+cd frontend
 npm install
 ```
 
----
+## Run the Project
 
-## 🚀 Running the App (Every Time)
+### Terminal A (backend)
 
-**Terminal 1 — Backend:**
-```bash
-cd skill-assessment-agent\backend
-venv\Scripts\activate.bat
+```powershell
+cd backend
+..\.venv\Scripts\Activate.ps1
 uvicorn main:app --reload --port 8000
 ```
 
-**Terminal 2 — Frontend:**
-```bash
-cd skill-assessment-agent\frontend
+### Terminal B (frontend)
+
+```powershell
+cd frontend
 npm run dev
 ```
 
-Then open → **http://localhost:5173**
+Open `http://localhost:5173`.
 
----
+## Free Deployment (Recommended)
 
-## 🗺️ Module Build Progress
+This project does not need Docker for a basic free deployment.
 
-- [x] **M1** — Project Scaffold (backend skeleton + DB schema + React shell)
-- [x] **M2** — Resume Upload + JD Input + Skill Extraction
-- [x] **M3** — Proficiency Assessment (AI questions + scoring)
-- [ ] **M4** — Study Plan Generator
-- [ ] **M5** — Progress Tracking Dashboard
-- [ ] **M6** — Extended Scope (assignments, mock interviews)
+Recommended setup:
+- Frontend: Vercel
+- Backend: Render Web Service
 
----
+Why this setup:
+- Vercel handles Vite/React easily.
+- Render runs FastAPI easily.
+- The app gets a public URL, so it works on phone, laptop, tablet, or any device with a browser.
 
-## Module 2 Features Implemented
+Important:
+- GitHub Pages can host only the frontend. It cannot run the FastAPI backend.
+- Your backend currently uses SQLite. On free hosting, SQLite is fine for demo use, but data may reset after restart or redeploy because free services often use ephemeral storage.
+- For a hackathon or portfolio demo, this is usually okay. For long-term persistent data, move later to a hosted database like Postgres.
 
-- Resume input via pasted text or PDF upload
-- Job description text input
-- Interview date picker with days remaining support
-- Gemini-powered skill extraction into:
-	- Present Skills (in resume + JD)
-	- Lacking Skills (in JD but not resume)
-- Session + skill persistence in SQLite tables (`sessions`, `skills`)
-- Frontend split-view with color-coded Present vs Lacking skills
+### Step 1: Push the repo to GitHub
 
-### Module 2 API
+From the project root:
 
-`POST /api/module2/extract-skills`
-
-Form fields:
-- `resume_text` (optional when `resume_file` is provided)
-- `resume_file` (optional when `resume_text` is provided, must be PDF)
-- `job_description` (required)
-- `interview_date` (required, `YYYY-MM-DD`)
-
-Response:
-- `session_id`
-- `interview_date`
-- `days_remaining`
-- `present_skills`
-- `lacking_skills`
-
-## Module 3 Features Implemented
-
-- Generates 5 Gemini-powered questions per present skill, increasing in difficulty
-- Conversational, one-question-at-a-time assessment UI
-- Answers are scored by Gemini on a 0-1 scale with instant feedback
-- Skill proficiency averages are saved back to `skills`
-- Priority weights are recalculated so weaker skills get more study time later
-- All question attempts are saved in `questions`
-
-### Module 3 API
-
-`POST /api/module3/sessions/{session_id}/start-assessment`
-- Generates missing questions for all present skills and starts the assessment
-
-`GET /api/module3/sessions/{session_id}/next-question`
-- Returns the next unanswered question or a completion summary
-
-`POST /api/module3/questions/{question_id}/answer`
-- Saves the answer, Gemini score, feedback, and recalculates skill weight
-
-`GET /api/module3/sessions/{session_id}/summary`
-- Returns per-skill scores, priority weights, and progress
-
----
-
-## 📁 Project Structure
-
+```powershell
+git init
+git add .
+git commit -m "Initial commit"
+git branch -M main
+git remote add origin https://github.com/YOUR_USERNAME/YOUR_REPO.git
+git push -u origin main
 ```
-skill-assessment-agent/
-├── backend/
-│   ├── main.py          # FastAPI app + routes
-│   ├── database.py      # SQLite schema + helpers
-│   ├── config.py        # API keys, settings
-│   ├── .env             # Your secret keys (never commit this)
-│   └── requirements.txt
-├── frontend/
-│   ├── src/
-│   │   ├── App.jsx      # Main app + routing
-│   │   ├── main.jsx     # React entry point
-│   │   └── index.css    # Global styles + design tokens
-│   ├── index.html
-│   ├── vite.config.js
-│   └── package.json
-└── README.md
+
+If the repo already exists, just commit and push your latest changes.
+
+### Step 2: Deploy the backend on Render
+
+1. Sign in to Render.
+2. Click `New` -> `Web Service`.
+3. Connect your GitHub repo.
+4. Select this repo.
+5. Set:
+   - Root Directory: `backend`
+   - Environment: `Python 3`
+   - Build Command: `pip install -r requirements.txt`
+   - Start Command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
+6. Add environment variables:
+   - `GEMINI_API_KEY`
+   - `QUESTION_GEMINI_API_KEY`
+   - `PRACTICE_TEST_GEMINI_API_KEY`
+   - `ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173`
+7. Deploy.
+
+After deployment, copy your backend URL, for example:
+
+```text
+https://skillbridge-api.onrender.com
 ```
+
+Test it in the browser:
+
+```text
+https://skillbridge-api.onrender.com/health
+```
+
+If health works, backend is live.
+
+### Step 3: Deploy the frontend on Vercel
+
+1. Sign in to Vercel.
+2. Click `Add New...` -> `Project`.
+3. Import the same GitHub repo.
+4. Set:
+   - Root Directory: `frontend`
+   - Framework Preset: `Vite`
+5. Add environment variable:
+   - `VITE_API_BASE=https://skillbridge-api.onrender.com`
+6. Deploy.
+
+After deployment, copy the frontend URL, for example:
+
+```text
+https://skillbridge.vercel.app
+```
+
+### Step 4: Update backend CORS with your real frontend URL
+
+Go back to Render and change `ALLOWED_ORIGINS` to include your deployed frontend URL:
+
+```text
+https://skillbridge.vercel.app,http://localhost:5173,http://127.0.0.1:5173
+```
+
+Save and redeploy the backend.
+
+### Step 5: Test from any device
+
+Open the Vercel frontend URL on:
+- your laptop
+- your phone
+- another computer
+
+As long as the device has internet and a browser, it should work.
+
+### If you want to use GitHub Pages instead of Vercel
+
+You still need Render or another backend host for FastAPI.
+GitHub Pages alone is not enough for this project.
+
+## Typical User Flow
+
+1. Submit resume + JD + interview date.
+2. Review extracted present/lacking skills.
+3. Complete assessment questions.
+4. Generate and follow study plan.
+5. Mark all study topics complete.
+6. Take and submit final practice test.
+
+## Reset Data and Restore Project State
+
+### A. Reset only runtime data (recommended for fresh testing)
+
+1. Stop backend server.
+2. Delete database file:
+
+```powershell
+Remove-Item backend\assessment.db -ErrorAction SilentlyContinue
+Remove-Item backend\assessment.db-wal -ErrorAction SilentlyContinue
+Remove-Item backend\assessment.db-shm -ErrorAction SilentlyContinue
+```
+
+3. Start backend again. Tables are auto-created at startup.
+
+### B. Restore code to latest committed state (git)
+
+Warning: this discards uncommitted changes.
+
+```powershell
+git status
+git restore .
+git clean -fd
+```
+
+If you want to keep your edits, commit or stash first:
+
+```powershell
+git add .
+git commit -m "save work"
+# or
+git stash push -u
+```
+
+### C. Restore selected files from local checkpoint folder
+
+This repository includes `checkpoint_module3_stable_2026-04-26/` with baseline files.
+You can manually copy checkpoint files back into `backend/` or `frontend/src/` if you want a partial rollback.
+
+## Troubleshooting
+
+### Backend fails to start
+- Ensure virtual environment is activated.
+- Ensure dependencies are installed from `backend/requirements.txt`.
+- Check that Gemini keys exist in `backend/.env`.
+
+### Study plan checkboxes fail
+- Refresh the page after plan regeneration.
+- Confirm backend is running and DB is writable.
+- If needed, reset DB (section A above).
+
+### Practice test generation unavailable
+- Confirm at least one Gemini key is configured.
+- Confirm quota is available.
+- Complete study plan to 100% before generating test.
+
+## Notes
+
+- Database is local SQLite file storage, no external DB required.
+- CORS is controlled by `ALLOWED_ORIGINS`.
+- This project is built for rapid local development and demo workflows.

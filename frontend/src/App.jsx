@@ -7,6 +7,7 @@ const STEPS = {
   SKILLS:     'skills',
   ASSESSMENT: 'assessment',
   PLAN:       'plan',
+  PRACTICE_TEST: 'practice_test',
 }
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8000'
@@ -38,6 +39,39 @@ function formatCountdown(interviewDate) {
   const secs = totalSeconds % 60
 
   return `${days}d ${String(hours).padStart(2, '0')}h ${String(mins).padStart(2, '0')}m ${String(secs).padStart(2, '0')}s`
+}
+
+function getYouTubeEmbedUrl(url) {
+  if (!url) {
+    return ''
+  }
+
+  try {
+    const parsed = new URL(url)
+    const hostname = parsed.hostname.toLowerCase()
+
+    if (hostname.includes('youtu.be')) {
+      const videoId = parsed.pathname.replace('/', '').trim()
+      return videoId ? `https://www.youtube.com/embed/${videoId}` : ''
+    }
+
+    if (hostname.includes('youtube.com')) {
+      const playlistId = parsed.searchParams.get('list')
+      const videoId = parsed.searchParams.get('v')
+
+      if (videoId) {
+        return `https://www.youtube.com/embed/${videoId}`
+      }
+
+      if (playlistId) {
+        return `https://www.youtube.com/embed/videoseries?list=${playlistId}`
+      }
+    }
+  } catch {
+    return ''
+  }
+
+  return ''
 }
 
 function HomePage({ onStart }) {
@@ -596,14 +630,22 @@ function AssessmentPage({ sessionId, skillResult, onBack, onGoPlan }) {
   )
 }
 
-function PlanPage({ sessionId, skillResult, onBack }) {
+function PlanPage({ sessionId, skillResult, onBack, onTakePracticeTest }) {
   const [plan, setPlan] = useState(null)
   const [isLoading, setIsLoading] = useState(true)
   const [isGenerating, setIsGenerating] = useState(false)
   const [error, setError] = useState('')
   const [countdown, setCountdown] = useState('Set interview date to start timer')
 
-  const interviewDate = plan?.interview_date || skillResult?.interview_date
+  const interviewDate = plan?.interview_date || skillResult?.interview_date || ''
+  const planMode = plan?.plan_mode || 'daily'
+  const topicSections = planMode === 'focus'
+    ? [{ key: 'focus', title: 'Focus Areas', topics: plan?.focus_topics || [] }]
+    : (plan?.day_groups || []).map((day) => ({
+        key: `day-${day.day_number}`,
+        title: `Day ${day.day_number}`,
+        topics: day.topics,
+      }))
 
   useEffect(() => {
     setCountdown(formatCountdown(interviewDate))
@@ -679,12 +721,18 @@ function PlanPage({ sessionId, skillResult, onBack }) {
     }
   }
 
-  const handleToggleTopic = async (topicId, checked) => {
+  const handleToggleTopic = async (topic, checked) => {
     setError('')
     try {
       const response = await axios.patch(
-        `${API_BASE}/api/module4/topics/${topicId}/completion`,
-        { is_completed: checked },
+        `${API_BASE}/api/module4/topics/${topic.id}/completion`,
+        {
+          is_completed: checked,
+          plan_id: plan?.plan_id,
+          skill_id: topic.skill_id,
+          topic_name: topic.topic_name,
+          day_number: topic.day_number,
+        },
         { timeout: REQUEST_TIMEOUT_MS },
       )
       setPlan(response.data.plan)
@@ -709,9 +757,19 @@ function PlanPage({ sessionId, skillResult, onBack }) {
     <section style={s.pageWrap}>
       <div style={s.panelGlow} />
 
+      {(plan?.progress_percent || 0) >= 100 ? (
+        <div style={s.topCtaWrap}>
+          <button style={s.primaryBtn} onClick={onTakePracticeTest}>Take Practice Test</button>
+        </div>
+      ) : null}
+
       <div style={s.planHeader}>
         <h2 style={s.cardTitle}>Module 4: Study Plan Generator</h2>
-        <p style={s.cardSub}>Day-by-day plan from your assessed present skills, lacking skills, and interview timeline.</p>
+        <p style={s.cardSub}>
+          {planMode === 'focus'
+            ? 'Condensed AI study focus plan built from your assessed skills and interview timeline.'
+            : 'Day-by-day plan from your assessed present skills, lacking skills, and interview timeline.'}
+        </p>
       </div>
 
       <div style={s.planStatsGrid}>
@@ -735,17 +793,17 @@ function PlanPage({ sessionId, skillResult, onBack }) {
 
       <div style={s.planShell}>
         <div style={s.planDaysColumn}>
-          {plan?.day_groups?.map((day) => (
-            <div key={day.day_number} style={s.dayCard}>
-              <div style={s.dayTitle}>Day {day.day_number}</div>
+          {topicSections.map((section) => (
+            <div key={section.key} style={s.dayCard}>
+              <div style={s.dayTitle}>{section.title}</div>
               <div style={s.dayTopicsList}>
-                {day.topics.map((topic) => (
+                {section.topics.map((topic) => (
                   <div key={topic.id} style={s.topicCard}>
                     <label style={s.topicTopRow}>
                       <input
                         type='checkbox'
                         checked={topic.is_completed}
-                        onChange={(e) => handleToggleTopic(topic.id, e.target.checked)}
+                        onChange={(e) => handleToggleTopic(topic, e.target.checked)}
                       />
                       <div>
                         <div style={s.topicTitle}>{topic.topic_name}</div>
@@ -802,6 +860,33 @@ function PlanPage({ sessionId, skillResult, onBack }) {
             ))}
           </div>
 
+          {(plan?.suggested_videos || []).length ? (
+            <div style={s.chartSection}>
+              <div style={s.chartHeader}>Watch Suggestions</div>
+              {(plan?.suggested_videos || []).map((video, index) => {
+                const embedUrl = getYouTubeEmbedUrl(video.url)
+                return (
+                  <div key={`${video.url}-${index}`} style={s.videoCard}>
+                    {embedUrl ? (
+                      <iframe
+                        style={s.videoFrame}
+                        src={embedUrl}
+                        title={video.title}
+                        allow='accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture'
+                        allowFullScreen
+                      />
+                    ) : null}
+                    <div style={s.videoSkill}>{video.skill_name}</div>
+                    <div style={s.videoTitle}>{video.title}</div>
+                    <a href={video.url} target='_blank' rel='noreferrer' style={s.videoLink}>
+                      Watch on YouTube
+                    </a>
+                  </div>
+                )
+              })}
+            </div>
+          ) : null}
+
           <button style={s.primaryBtn} onClick={handleRegenerate} disabled={isGenerating}>
             {isGenerating ? 'Regenerating...' : 'Regenerate Plan'}
           </button>
@@ -810,6 +895,191 @@ function PlanPage({ sessionId, skillResult, onBack }) {
       </div>
 
       {error ? <div style={s.errorText}>{error}</div> : null}
+    </section>
+  )
+}
+function PracticeTestPage({ sessionId, onBack }) {
+  const [test, setTest] = useState(null)
+  const [answers, setAnswers] = useState({})
+  const [result, setResult] = useState(null)
+  const [isLoading, setIsLoading] = useState(true)
+  const [isGenerating, setIsGenerating] = useState(false)
+  const [isSubmitting, setIsSubmitting] = useState(false)
+  const [error, setError] = useState('')
+
+  const loadExistingTest = async () => {
+    const response = await axios.get(`${API_BASE}/api/module5/sessions/${sessionId}/test`, {
+      timeout: REQUEST_TIMEOUT_MS,
+    })
+    setTest(response.data)
+    if (response.data?.is_submitted) {
+      setResult({ score_percent: response.data.score_percent })
+    }
+  }
+
+  const generateTest = async () => {
+    const response = await axios.post(`${API_BASE}/api/module5/sessions/${sessionId}/generate-test`, null, {
+      timeout: REQUEST_TIMEOUT_MS,
+    })
+    setTest(response.data)
+    setAnswers({})
+    setResult(null)
+  }
+
+  useEffect(() => {
+    let active = true
+
+    const bootstrap = async () => {
+      setIsLoading(true)
+      setError('')
+      try {
+        await loadExistingTest()
+      } catch (err) {
+        if (err?.response?.status === 404) {
+          setIsGenerating(true)
+          try {
+            await generateTest()
+          } finally {
+            if (active) setIsGenerating(false)
+          }
+        } else {
+          throw err
+        }
+      } finally {
+        if (active) setIsLoading(false)
+      }
+    }
+
+    bootstrap().catch((err) => {
+      if (!active) return
+      const message = err?.code === 'ECONNABORTED'
+        ? 'Practice test request timed out. Please retry.'
+        : (err?.response?.data?.detail || 'Failed to load practice test.')
+      setError(message)
+      setIsLoading(false)
+      setIsGenerating(false)
+    })
+
+    return () => {
+      active = false
+    }
+  }, [sessionId])
+
+  const handleSelect = (questionId, optionIndex) => {
+    setAnswers((prev) => ({ ...prev, [questionId]: optionIndex }))
+  }
+
+  const handleSubmit = async () => {
+    if (!test?.questions?.length) return
+    const answeredCount = Object.keys(answers).length
+    if (answeredCount !== test.questions.length) {
+      setError('Please answer all questions before submitting.')
+      return
+    }
+
+    setIsSubmitting(true)
+    setError('')
+    try {
+      const payload = {
+        answers: test.questions.map((q) => ({
+          question_id: q.id,
+          selected_option_index: Number(answers[q.id]),
+        })),
+      }
+      const response = await axios.post(
+        `${API_BASE}/api/module5/tests/${test.test_id}/submit`,
+        payload,
+        { timeout: REQUEST_TIMEOUT_MS },
+      )
+      setResult({
+        score_percent: response.data.score_percent,
+        correct_count: response.data.correct_count,
+        total_questions: response.data.total_questions,
+      })
+      setTest(response.data.test)
+    } catch (err) {
+      const message = err?.code === 'ECONNABORTED'
+        ? 'Submitting test timed out. Please retry.'
+        : (err?.response?.data?.detail || 'Failed to submit test.')
+      setError(message)
+    } finally {
+      setIsSubmitting(false)
+    }
+  }
+
+  if (isLoading) {
+    return (
+      <section style={s.pageWrap}>
+        <div style={s.formCard}>
+          <h2 style={s.cardTitle}>Final Practice Test</h2>
+          <p style={s.cardSub}>{isGenerating ? 'Generating 10 AI MCQs...' : 'Loading your practice test...'}</p>
+        </div>
+      </section>
+    )
+  }
+
+  return (
+    <section style={s.pageWrap}>
+      <div style={s.panelGlow} />
+
+      <div style={s.formCard}>
+        <div style={s.planHeader}>
+          <h2 style={s.cardTitle}>Final Practice Test</h2>
+          <p style={s.cardSub}>10 mixed MCQ questions from your completed study plan.</p>
+        </div>
+
+        {result ? (
+          <div style={s.summaryPanel}>
+            <div style={s.summaryTitle}>Final Score</div>
+            <div style={s.summaryRow}>Overall Score: {result.score_percent}%</div>
+            {result.correct_count != null ? (
+              <div style={s.summaryRow}>Correct: {result.correct_count} / {result.total_questions}</div>
+            ) : null}
+          </div>
+        ) : null}
+
+        <div style={s.optionPanel}>
+          <div style={s.dayTopicsList}>
+            {(test?.questions || []).map((question) => (
+              <div key={question.id} style={s.topicCard}>
+                <div style={s.topicMeta}>Q{question.question_index} • {question.skill_name || 'Mixed'}{question.topic_name ? ` • ${question.topic_name}` : ''}</div>
+                <div style={s.topicTitle}>{question.question_text}</div>
+
+                <div style={s.optionList}>
+                  {question.options.map((option, idx) => {
+                    const value = idx + 1
+                    const isSelected = Number(answers[question.id]) === value
+                    return (
+                      <button
+                        key={`${question.id}-${value}`}
+                        type='button'
+                        style={{ ...s.optionBtn, ...(isSelected ? s.optionBtnSelected : {}) }}
+                        onClick={() => handleSelect(question.id, value)}
+                        disabled={Boolean(result)}
+                      >
+                        <div style={s.optionLetter}>{String.fromCharCode(65 + idx)}</div>
+                        <div style={s.optionText}>{option}</div>
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {!result ? (
+            <button style={s.sendBtn} onClick={handleSubmit} disabled={isSubmitting}>
+              {isSubmitting ? 'Submitting...' : 'Submit Test'}
+            </button>
+          ) : null}
+
+          <div style={s.resultActions}>
+            <button style={s.ghostBtn} onClick={onBack}>Back to Plan</button>
+          </div>
+        </div>
+
+        {error ? <div style={s.errorText}>{error}</div> : null}
+      </div>
     </section>
   )
 }
@@ -830,6 +1100,7 @@ function Nav({ step, onHome }) {
     { label: 'Skills',     key: STEPS.SKILLS },
     { label: 'Assessment', key: STEPS.ASSESSMENT },
     { label: 'Plan',       key: STEPS.PLAN },
+    { label: 'Practice Test', key: STEPS.PRACTICE_TEST },
   ]
   const currentIndex = navStepList.findIndex(n => n.key === step)
 
@@ -913,10 +1184,17 @@ export default function App() {
           <PlanPage
             sessionId={sessionId}
             skillResult={skillResult}
+            onTakePracticeTest={() => setStep(STEPS.PRACTICE_TEST)}
             onBack={() => {
               const hasPresentSkills = (skillResult?.present_skills?.length || 0) > 0
               setStep(hasPresentSkills ? STEPS.ASSESSMENT : STEPS.SKILLS)
             }}
+          />
+        )}
+        {step === STEPS.PRACTICE_TEST && (
+          <PracticeTestPage
+            sessionId={sessionId}
+            onBack={() => setStep(STEPS.PLAN)}
           />
         )}
       </main>
@@ -1506,6 +1784,13 @@ const s = {
     position: 'relative',
     zIndex: 1,
   },
+  topCtaWrap: {
+    width: 'min(1120px, 100%)',
+    display: 'flex',
+    justifyContent: 'flex-end',
+    position: 'relative',
+    zIndex: 1,
+  },
   planStatsGrid: {
     width: 'min(1120px, 100%)',
     display: 'grid',
@@ -1676,6 +1961,39 @@ const s = {
     color: '#c8c8e4',
     fontSize: 11,
     textAlign: 'right',
+  },
+  videoCard: {
+    display: 'grid',
+    gap: 8,
+    padding: 10,
+    borderRadius: 12,
+    border: '1px solid #2b2b3d',
+    background: '#0f0f18',
+  },
+  videoFrame: {
+    width: '100%',
+    aspectRatio: '16 / 9',
+    border: 'none',
+    borderRadius: 10,
+    background: '#09090f',
+  },
+  videoSkill: {
+    color: '#8fb8ff',
+    fontSize: 11,
+    fontWeight: 700,
+    textTransform: 'uppercase',
+    letterSpacing: '0.6px',
+  },
+  videoTitle: {
+    color: '#f0f0f8',
+    fontSize: 13,
+    lineHeight: 1.45,
+    fontWeight: 600,
+  },
+  videoLink: {
+    color: '#9ecbff',
+    fontSize: 12,
+    textDecoration: 'none',
   },
   placeholder: {
     flex: 1, display: 'flex', flexDirection: 'column',

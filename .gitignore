@@ -1,5 +1,12 @@
 .env
+backend/.env
+.venv/
+backend/venv/
 node_modules/
 __pycache__/
 dist/
+frontend/dist/
+backend/*.db
+backend/*.db-wal
+backend/*.db-shm
 *.log

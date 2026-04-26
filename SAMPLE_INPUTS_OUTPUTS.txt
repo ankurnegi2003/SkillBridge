@@ -1,0 +1,221 @@
+SkillBridge Sample Inputs and Outputs
+=====================================
+
+This file contains practical sample payloads and abbreviated responses
+for core APIs in this project.
+
+------------------------------------------------------------
+1) Module 2: Extract Skills
+------------------------------------------------------------
+Endpoint:
+POST /api/module2/extract-skills
+
+Sample form-data input:
+- resume_text:
+  "Python backend developer with FastAPI, SQL, and Docker. Built REST APIs and auth middleware."
+- job_description:
+  "Looking for Python, FastAPI, SQL, AWS, CI/CD, and system design."
+- interview_date:
+  "2026-05-10"
+
+Sample response (abbreviated):
+{
+  "session_id": 101,
+  "interview_date": "2026-05-10",
+  "days_remaining": 14,
+  "matching_engine": "ai:gemini-1.5-flash-latest",
+  "question_generation_status": "queued",
+  "present_skills": ["Python", "FastAPI", "SQL", "Docker"],
+  "lacking_skills": ["AWS", "CI/CD", "System Design"]
+}
+
+------------------------------------------------------------
+2) Module 3: Start Assessment
+------------------------------------------------------------
+Endpoint:
+POST /api/module3/sessions/101/start-assessment
+
+Sample response:
+{
+  "session_id": 101,
+  "status": "skills_extracted",
+  "questions_created": 0,
+  "total_questions": 9,
+  "next_question": {
+    "id": 700,
+    "skill_id": 900,
+    "skill_name": "Python",
+    "question_index": 1,
+    "difficulty_level": 1,
+    "question_text": "Which statement about Python generators is correct?",
+    "options": [
+      "They evaluate all values immediately",
+      "They return one item at a time",
+      "They are only for async code",
+      "They cannot be iterated twice"
+    ]
+  }
+}
+
+------------------------------------------------------------
+3) Module 3: Submit Answer
+------------------------------------------------------------
+Endpoint:
+POST /api/module3/questions/700/answer
+Form field:
+- selected_option_index=2
+
+Sample response (abbreviated):
+{
+  "question_id": 700,
+  "session_id": 101,
+  "skill_id": 900,
+  "skill_name": "Python",
+  "score": 1.0,
+  "feedback": "Correct. Generators are lazy and yield values incrementally.",
+  "avg_skill_score": 0.83,
+  "priority_weight": 1.68,
+  "is_complete": false,
+  "next_question": {
+    "id": 701,
+    "skill_name": "Python",
+    "question_index": 2,
+    "difficulty_level": 2
+  }
+}
+
+------------------------------------------------------------
+4) Module 4: Generate Study Plan
+------------------------------------------------------------
+Endpoint:
+POST /api/module4/sessions/101/generate-plan
+
+Sample response (abbreviated):
+{
+  "session_id": 101,
+  "plan_id": 44,
+  "total_days": 14,
+  "total_topics": 7,
+  "completed_topics": 0,
+  "progress_percent": 0,
+  "plan_mode": "focus",
+  "generation_engine": "ai:gemini-1.5-flash-latest",
+  "day_groups": [
+    {
+      "day_number": 1,
+      "topics": [
+        {
+          "id": 3001,
+          "skill_name": "AWS",
+          "topic_name": "AWS - Core Fundamentals",
+          "estimated_hours": 2.8,
+          "is_completed": false
+        }
+      ]
+    }
+  ]
+}
+
+------------------------------------------------------------
+5) Module 4: Mark Topic Complete
+------------------------------------------------------------
+Endpoint:
+PATCH /api/module4/topics/3001/completion
+
+Sample JSON body:
+{
+  "is_completed": true,
+  "plan_id": 44,
+  "skill_id": 910,
+  "topic_name": "AWS - Core Fundamentals",
+  "day_number": 1
+}
+
+Sample response (abbreviated):
+{
+  "topic_id": 3001,
+  "is_completed": true,
+  "plan": {
+    "session_id": 101,
+    "completed_topics": 1,
+    "total_topics": 7,
+    "progress_percent": 14.29
+  }
+}
+
+------------------------------------------------------------
+6) Module 5: Generate Final Test
+------------------------------------------------------------
+Precondition:
+- study plan progress must be 100%
+
+Endpoint:
+POST /api/module5/sessions/101/generate-test
+
+Sample response (abbreviated):
+{
+  "session_id": 101,
+  "test_id": 55,
+  "total_questions": 10,
+  "generation_engine": "ai:multi-key",
+  "questions": [
+    {
+      "id": 8101,
+      "question_index": 1,
+      "skill_name": "Python",
+      "topic_name": "Async API patterns",
+      "question_text": "Which statement about await in Python async functions is correct?",
+      "options": ["...", "...", "...", "..."]
+    }
+  ]
+}
+
+------------------------------------------------------------
+7) Module 5: Submit Final Test
+------------------------------------------------------------
+Endpoint:
+POST /api/module5/tests/55/submit
+
+Sample JSON body:
+{
+  "answers": [
+    {"question_id": 8101, "selected_option_index": 2},
+    {"question_id": 8102, "selected_option_index": 1},
+    {"question_id": 8103, "selected_option_index": 4},
+    {"question_id": 8104, "selected_option_index": 3},
+    {"question_id": 8105, "selected_option_index": 2},
+    {"question_id": 8106, "selected_option_index": 1},
+    {"question_id": 8107, "selected_option_index": 4},
+    {"question_id": 8108, "selected_option_index": 3},
+    {"question_id": 8109, "selected_option_index": 2},
+    {"question_id": 8110, "selected_option_index": 1}
+  ]
+}
+
+Sample response:
+{
+  "test_id": 55,
+  "session_id": 101,
+  "correct_count": 7,
+  "total_questions": 10,
+  "score_percent": 70.0,
+  "test": {
+    "is_submitted": true,
+    "score_percent": 70.0
+  }
+}
+
+------------------------------------------------------------
+Error examples
+------------------------------------------------------------
+- 400: Interview date format invalid
+  {"detail": "Interview date must be YYYY-MM-DD."}
+
+- 404: Study plan not created yet
+  {"detail": "Study plan not found."}
+
+- 400: Practice test attempted before plan completion
+  {"detail": "Complete 100% of the study plan before taking the practice test."}
+
+- 503: AI generation unavailable
+  {"detail": "AI practice test generation is currently unavailable. ..."}

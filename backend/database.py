@@ -103,6 +103,34 @@ def init_db():
         )
     """)
 
+    # Final practice test table — one generated test per session
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS practice_tests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL UNIQUE,
+            total_questions INTEGER DEFAULT 10,
+            score_percent REAL,
+            submitted_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (session_id) REFERENCES sessions(id)
+        )
+    """)
+
+    # Practice test questions
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS practice_test_questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            test_id INTEGER NOT NULL,
+            question_index INTEGER NOT NULL,
+            skill_name TEXT,
+            topic_name TEXT,
+            question_text TEXT NOT NULL,
+            options TEXT NOT NULL,
+            correct_option_index INTEGER NOT NULL,
+            FOREIGN KEY (test_id) REFERENCES practice_tests(id)
+        )
+    """)
+
     # Backfill columns for databases created before Module 3.
     _add_column_if_missing(cursor, "questions", "question_index", "question_index INTEGER DEFAULT 1")
     _add_column_if_missing(cursor, "questions", "difficulty_level", "difficulty_level INTEGER DEFAULT 1")
