@@ -10,7 +10,8 @@ const STEPS = {
   PRACTICE_TEST: 'practice_test',
 }
 
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8000'
+const API_BASE = "https://skillbridge-fq88.onrender.com"
+// const API_BASE = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8000'
 const REQUEST_TIMEOUT_MS = 30000
 const startedAssessmentSessions = new Set()
 const assessmentStartInFlight = new Map()
