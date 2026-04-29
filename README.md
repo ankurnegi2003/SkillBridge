@@ -1,5 +1,8 @@
 # SkillBridge: AI Skill Assessment and Interview Prep Agent
 
+## Project live at - https://skill-bridge-steel.vercel.app/
+Note- The backend is on free tier Render, after clicking extract skills it will most probably give timeout error(backend takes 40-50 sec to wake up), try clicking a second time it will definitely work.
+
 SkillBridge is an end-to-end interview preparation application that:
 1. extracts present and lacking skills from resume plus job description,
 2. runs a skill assessment with AI-generated MCQ questions,
